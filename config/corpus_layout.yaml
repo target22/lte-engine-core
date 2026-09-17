@@ -1,0 +1,83 @@
+# config/corpus_layout.yaml
+#
+# DECLARATIVE CORPUS LAYOUT. The only place that says where the corpus lives
+# on disk, how its files are named, and what each compile target reads and
+# writes. Compiled by lte/engine/layout.py (compile_layout) and loaded by
+# lte/io/config_reader.py next to taxonomy.yaml and linter_rules.json.
+#
+# THIS FILE REPRODUCES THE PRE-LAYOUT CONVENTIONS EXACTLY:
+#   docs/<scope>/<partition>/<tractate...>/<slug>[.<role>].<vi|en>.md
+#   compile public   -> public/data/graph.json          (docs/public only)
+#   compile internal -> public/internal-data/graph-internal.json (both scopes)
+#   compile all      -> alias of internal
+# A compile with this file is byte-for-byte identical in its vi/en payload to
+# the compile before the layout existed (graph_hash unchanged).
+#
+# CROSS-FILE CONTRACTS, all checked at load time:
+#   * every partition in taxonomy.yaml gets a directory here (default:
+#     <scope path>/<partition id>); ids listed under `partitions` must exist
+#     in taxonomy.yaml;
+#   * every taxonomy `scope` value must be a scope id declared here;
+#   * `default_role` must be one of linter_rules.json#document_roles;
+#   * scope directories are pairwise disjoint, and so are partition
+#     directories;
+#   * a target with `exposure: public` may only read level-0 scopes.
+#
+# NOT CONFIGURED HERE (still pinned elsewhere; see the migration notes):
+#   nginx.conf routes, docker-compose.yml single-file volume mounts,
+#   src/layouts/app.js fetch paths. Change an `artifact` path only together
+#   with those three.
+
+layout_version: "1.0.0"
+
+# Directory under the repository root that holds the corpus. "." = repo root.
+root: "docs"
+
+# Visibility classes. `path` is relative to `root` (default: the id).
+# `level`: a [!ref-...] from a file in a lower-level scope to an anchor in a
+# higher-level scope is a boundary violation. Level 0 is publishable.
+scopes:
+  - {id: public,  path: public,  level: 0}
+  - {id: private, path: private, level: 10}
+  - {id: corporate, path: corporate, level: 5}
+
+# Per-partition directory overrides, keyed by taxonomy.yaml id.
+#   path          relative to the partition's scope directory (default: id)
+#   default_role  role for files whose name has no role segment
+#   pairs_with    this partition's files join the documents of another
+#                 partition in the same scope, matched by relative path
+# Empty: every partition lives at <scope>/<id>/, as before.
+partitions: {}
+
+filenames:
+  # mode "suffix": <slug>[.<role>].<locale><ext>, locale required.
+  # mode "none":   <slug>[.<role>]<ext>, every file has locale `default`.
+  # The first value is the default --lang and the first key in the artifact.
+  locale:
+    mode: suffix
+    values: [vi, en]
+  extensions: [".md"]
+  # The optional role segment's values come from
+  # linter_rules.json#document_roles; they are not repeated here.
+
+# Globs over paths relative to `root`. `*` and `?` stay within one path
+# segment; `**` spans segments (`**/x` also matches `x` at the root).
+# A matching file is not a corpus file: never compiled, never ingested,
+# never an error.
+ignore: []
+
+# Draft files under any directory with this name map to root:
+#   drafts/public/core/x.en.md -> docs/public/core/x.en.md
+staging:
+  root: drafts
+
+targets:
+  - id: public
+    scopes: [public]
+    artifact: public/data/graph.json
+    exposure: public
+  - id: internal
+    aliases: [all]
+    scopes: [public, private]
+    artifact: public/internal-data/graph-internal.json
+    exposure: restricted

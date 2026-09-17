@@ -1,0 +1,21 @@
+# Example deployment: layer labels for the flavors this taxonomy uses.
+# taxonomy.py rejects a flavor listed here that no partition uses.
+config_version: 1.0.0
+admonitions:
+  note:
+    layer_by_flavor:
+      kernel: KERNEL_CONTRACT
+      meta: META_CONSTITUTION
+      policy: POLICY_CONTRACT
+  warning:
+    layer_by_flavor:
+      kernel: TECHNICAL_DEBATE
+      meta: META_DEBATE
+      policy: POLICY_DEBATE
+    callout_kind: ref
+  tip:
+    layer_by_flavor:
+      kernel: OPERATIONAL_EXTENSIONS
+      meta: META_CHECKLIST
+      policy: EXECUTION_CHECKLIST
+    callout_kind: ops

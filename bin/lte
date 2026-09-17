@@ -1,0 +1,665 @@
+#!/usr/bin/env bash
+# lte -- LTE CLI front door (wrapper 1.0.0, contract 1).
+#
+# Installed once per host at /usr/local/bin/lte; serves every LTE repo on the
+# host. It carries NO engine knowledge: the repo's pinned engine (lib/lte)
+# declares commands, env mapping and image recipe in lte-engine.manifest.
+#
+#   lte [-C <dir>] <command> [args...]      engine command; args passed verbatim
+#   lte self version|env|doctor|build [...] wrapper-owned
+#   lte -h|--help   lte -V|--version
+#
+# RUNTIME (LTE_RUNTIME)
+#   docker (default)  container commands run in <image>:rt-<key>, identity
+#                     mounts (host path == container path), --network none,
+#                     --read-only, host uid:gid; host commands run on the host.
+#   native            every command runs on the host; argv[0] must exist in
+#                     $LTE_NATIVE_BIN_DIR (default <repo>/.venv/bin). No Docker.
+#
+# INPUTS (process env wins over <config>/lte.env; lte.env is allowlisted)
+#   process only : LTE_REPO_ROOT LTE_CONFIG_DIR LTE_DOCKER LTE_SELINUX_RELABEL
+#                  LTE_DRY_RUN LTE_DEBUG
+#   lte.env too  : LTE_RUNTIME LTE_ENGINE_DIR LTE_NATIVE_BIN_DIR LTE_IMAGE
+#                  LTE_ENV_PASSTHROUGH LTE_DOCKER_NETWORK
+#                  CAS_REPO CAS_BRANCH CAS_REMOTE_NAME CAS_REMOTE_URL
+# OUTPUTS (exported to host commands, set in containers)
+#   LTE_REPO_ROOT LTE_CONFIG_DIR LTE_ENGINE_DIR LTE_RUNTIME [LTE_IMAGE]
+#   + manifest `env` lines (e.g. SRKH_REPO_ROOT for the v1 Python engine)
+#
+# EXIT  engine code passed through | 64 usage | 69 unavailable | 78 config
+#       docker runtime may also return docker's own 125/126/127.
+#
+# Portability: bash >= 3.2 idioms (no assoc arrays / namerefs / readlink -f);
+# empty arrays expanded with ${a[@]+"${a[@]}"} for bash <= 4.3 under set -u.
+
+set -euo pipefail
+shopt -u patsub_replacement 2>/dev/null || true   # bash 5.2: '&' stays literal
+
+readonly LTE_WRAPPER_VERSION="1.0.0"
+readonly LTE_CONTRACT="1"
+readonly MANIFEST_NAME="lte-engine.manifest"
+readonly ENV_FILE_NAME="lte.env"
+readonly ROOT_MARKER="config/taxonomy.yaml"
+readonly EX_USAGE=64 EX_UNAVAILABLE=69 EX_CONFIG=78
+readonly RE_NAME='^[A-Za-z_][A-Za-z0-9_]*$'
+readonly RE_KV='^([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+readonly RE_CMD='^[a-z][a-z0-9-]*$'
+readonly DEFAULT_PASSTHROUGH="CAS_REPO CAS_BRANCH GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL TZ"
+
+die()  { local c=$1; shift; printf 'lte: error: %s\n' "$*" >&2; exit "$c"; }
+warn() { printf 'lte: warning: %s\n' "$*" >&2; }
+
+# ============================================================== path helpers
+physical_dir() { (cd -P -- "$1" 2>/dev/null && pwd -P); }
+
+from_repo() {   # relative paths in config are repo-relative
+    case $1 in /*) printf '%s' "$1" ;; *) printf '%s/%s' "$REPO_ROOT" "$1" ;; esac
+}
+
+under() {       # under <path> <root>
+    case "$1/" in "$2"/*) return 0 ;; esac
+    return 1
+}
+
+check_mount_path() {   # label path
+    case $2 in
+        *:* | *$'\n'*) die "$EX_CONFIG" "$1 contains ':' or a newline (not bind-mountable): $2" ;;
+    esac
+    case $2 in
+        / | /bin | /bin/* | /boot | /boot/* | /dev | /dev/* | /etc | /etc/* | \
+        /lib | /lib/* | /lib32 | /lib32/* | /lib64 | /lib64/* | /proc | /proc/* | \
+        /sbin | /sbin/* | /sys | /sys/* | /usr | /usr/* | /var | /run | /tmp | /home | /root)
+            die "$EX_CONFIG" "$1 is a system path; refusing to identity-mount it: $2" ;;
+    esac
+}
+
+# ============================================================== context
+resolve_repo() {
+    local d here
+    here=$(pwd -P)
+    if [[ -n ${LTE_REPO_ROOT:-} ]]; then
+        REPO_ROOT=$(physical_dir "$LTE_REPO_ROOT") ||
+            die "$EX_CONFIG" "LTE_REPO_ROOT is not a directory: $LTE_REPO_ROOT"
+    else
+        d=$here
+        while [[ ! -f "$d/$ROOT_MARKER" ]]; do
+            if [[ $d == / ]]; then
+                die "$EX_CONFIG" "not inside an LTE repo (no $ROOT_MARKER from $here upward); use -C <dir> or LTE_REPO_ROOT"
+            fi
+            d=$(dirname -- "$d")
+        done
+        REPO_ROOT=$d
+    fi
+    if [[ -n ${LTE_CONFIG_DIR:-} ]]; then
+        CONFIG_DIR=$(physical_dir "$(from_repo "$LTE_CONFIG_DIR")") ||
+            die "$EX_CONFIG" "LTE_CONFIG_DIR is not a directory: $LTE_CONFIG_DIR"
+    else
+        CONFIG_DIR=$(physical_dir "$REPO_ROOT/config") ||
+            die "$EX_CONFIG" "missing config dir: $REPO_ROOT/config"
+    fi
+    if under "$here" "$REPO_ROOT"; then RUN_CWD=$here; else RUN_CWD=$REPO_ROOT; fi
+}
+
+load_env_file() {   # safe KEY=VALUE parser: allowlisted keys, no expansion
+    local f=$CONFIG_DIR/$ENV_FILE_NAME line key val n=0
+    local re_skip='^[[:space:]]*(#.*)?$'
+    local re_line='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+    local re_dq='^"(.*)"$' re_sq="^'(.*)'\$"
+    ENV_FILE_LOADED=
+    [[ -f $f ]] || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line=${line%$'\r'}
+        if [[ $line =~ $re_skip ]]; then continue; fi
+        if ! [[ $line =~ $re_line ]]; then
+            die "$EX_CONFIG" "$f:$n: expected KEY=VALUE"
+        fi
+        key=${BASH_REMATCH[2]}
+        val=${BASH_REMATCH[3]}
+        if [[ $val =~ $re_dq ]] || [[ $val =~ $re_sq ]]; then val=${BASH_REMATCH[1]}; fi
+        case $key in
+            LTE_RUNTIME | LTE_ENGINE_DIR | LTE_NATIVE_BIN_DIR | LTE_IMAGE | \
+            LTE_ENV_PASSTHROUGH | LTE_DOCKER_NETWORK | \
+            CAS_REPO | CAS_BRANCH | CAS_REMOTE_NAME | CAS_REMOTE_URL) ;;
+            *) die "$EX_CONFIG" "$f:$n: key not allowed in $ENV_FILE_NAME: $key" ;;
+        esac
+        if [[ -z ${!key+x} ]]; then export "$key=$val"; fi
+    done <"$f"
+    ENV_FILE_LOADED=$f
+}
+
+resolve_engine() {
+    local cand
+    if [[ -n ${LTE_ENGINE_DIR:-} ]]; then
+        cand=$(from_repo "$LTE_ENGINE_DIR")
+    elif [[ -e $REPO_ROOT/lib/lte ]]; then
+        cand=$REPO_ROOT/lib/lte
+    else
+        cand=$REPO_ROOT                      # the engine repo itself
+    fi
+    ENGINE_DIR=$(physical_dir "$cand") || die "$EX_CONFIG" "engine directory not found: $cand"
+    MANIFEST=$ENGINE_DIR/$MANIFEST_NAME
+    [[ -f $MANIFEST ]] ||
+        die "$EX_CONFIG" "no $MANIFEST_NAME in $ENGINE_DIR (submodule not initialised? git submodule update --init lib/lte)"
+}
+
+load_manifest() {
+    local line d p flag n=0 i
+    local -a f
+    CONTRACT="" IMAGE_NAME="" IMAGE_DOCKERFILE=""
+    IMAGE_INPUTS=() REQ_CONFIG=() PASS_NAMES=() ENV_ALL=() ENV_DOCKER=() ENV_NATIVE=()
+    CMD_NAMES=() CMD_PLACE=() CMD_ARGV=() PROBE_PLACE=() PROBE_ARGV=()
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line=${line%%#*}
+        line=${line%$'\r'}
+        f=()
+        read -r -a f <<<"$line" || true
+        ((${#f[@]})) || continue
+        d=${f[0]}
+        case $d in
+            contract | image | image-dockerfile)
+                ((${#f[@]} == 2)) || mbad "$d takes exactly one value"
+                case $d in
+                    contract) CONTRACT=${f[1]} ;;
+                    image) IMAGE_NAME=${f[1]} ;;
+                    image-dockerfile) IMAGE_DOCKERFILE=${f[1]} ;;
+                esac ;;
+            image-inputs | config | pass)
+                ((${#f[@]} >= 2)) || mbad "$d needs at least one value"
+                case $d in
+                    image-inputs) IMAGE_INPUTS+=("${f[@]:1}") ;;
+                    config) REQ_CONFIG+=("${f[@]:1}") ;;
+                    pass)
+                        for i in "${f[@]:1}"; do
+                            [[ $i =~ $RE_NAME ]] || mbad "bad variable name: $i"
+                            PASS_NAMES+=("$i")
+                        done ;;
+                esac ;;
+            env | env.docker | env.native)
+                ((${#f[@]} == 2)) && [[ ${f[1]} =~ $RE_KV ]] || mbad "$d expects NAME=VALUE"
+                case $d in
+                    env) ENV_ALL+=("${f[1]}") ;;
+                    env.docker) ENV_DOCKER+=("${f[1]}") ;;
+                    env.native) ENV_NATIVE+=("${f[1]}") ;;
+                esac ;;
+            cmd)
+                ((${#f[@]} >= 4)) || mbad "cmd expects: cmd <name> <placement> <argv...>"
+                [[ ${f[1]} =~ $RE_CMD && ${f[1]} != self && ${f[1]} != help ]] ||
+                    mbad "invalid command name: ${f[1]}"
+                for i in ${CMD_NAMES[@]+"${CMD_NAMES[@]}"}; do
+                    [[ $i != "${f[1]}" ]] || mbad "duplicate command: $i"
+                done
+                p=${f[2]}
+                case $p in
+                    host) ;;
+                    container | container+*)
+                        local rest=${p#container}
+                        while [[ -n $rest ]]; do
+                            rest=${rest#+}; flag=${rest%%+*}; rest=${rest#"$flag"}
+                            case $flag in net | cas-rw) ;; *) mbad "unknown placement flag: $flag" ;; esac
+                        done ;;
+                    *) mbad "unknown placement: $p" ;;
+                esac
+                CMD_NAMES+=("${f[1]}"); CMD_PLACE+=("$p"); CMD_ARGV+=("${f[*]:3}") ;;
+            probe)
+                ((${#f[@]} >= 3)) || mbad "probe expects: probe <host|container> <argv...>"
+                case ${f[1]} in host | container) ;; *) mbad "probe placement: ${f[1]}" ;; esac
+                PROBE_PLACE+=("${f[1]}"); PROBE_ARGV+=("${f[*]:2}") ;;
+            *) mbad "unknown directive: $d" ;;
+        esac
+    done <"$MANIFEST"
+    [[ $CONTRACT == "$LTE_CONTRACT" ]] ||
+        die "$EX_CONFIG" "$MANIFEST: contract '${CONTRACT:-<missing>}' is not supported by this wrapper (supports $LTE_CONTRACT); upgrade /usr/local/bin/lte"
+    ((${#CMD_NAMES[@]})) || die "$EX_CONFIG" "$MANIFEST declares no commands"
+}
+mbad() { die "$EX_CONFIG" "$MANIFEST:$n: $1"; }
+
+resolve_runtime() {
+    RUNTIME=${LTE_RUNTIME:-docker}
+    case $RUNTIME in
+        docker | native) ;;
+        *) die "$EX_CONFIG" "LTE_RUNTIME must be 'docker' or 'native', got: $RUNTIME" ;;
+    esac
+    NATIVE_BIN_DIR=$(from_repo "${LTE_NATIVE_BIN_DIR:-.venv/bin}")
+    DOCKER=${LTE_DOCKER:-docker}
+    IMAGE_REF="" RUNTIME_KEY=""
+    [[ $RUNTIME == docker ]] || return 0
+    if [[ -n ${LTE_IMAGE:-} ]]; then
+        IMAGE_REF=$LTE_IMAGE
+    elif [[ -n $IMAGE_NAME && -n $IMAGE_DOCKERFILE && ${#IMAGE_INPUTS[@]} -gt 0 ]]; then
+        compute_runtime_key
+        IMAGE_REF=$IMAGE_NAME:rt-$RUNTIME_KEY
+    fi
+}
+
+compute_runtime_key() {   # content address of the image recipe (not the code)
+    local key
+    key=$(
+        cd -- "$ENGINE_DIR" || exit 1
+        for f in "${IMAGE_INPUTS[@]}"; do
+            [[ -f $f ]] || { printf 'lte: error: image input missing: %s/%s\n' "$ENGINE_DIR" "$f" >&2; exit 1; }
+            printf '%s\0%s\0' "$f" "$(wc -c <"$f" | tr -d ' ')"
+            cat -- "$f"
+        done | git hash-object --stdin
+    ) || exit "$EX_CONFIG"
+    RUNTIME_KEY=${key:0:12}
+}
+
+resolve_all() {
+    resolve_repo
+    load_env_file
+    resolve_engine
+    load_manifest
+    resolve_runtime
+}
+
+# ============================================================== execution
+subst() {   # expand {repo} {config} {engine} {image} -> SUBST
+    local s=$1
+    if [[ $s == *'{image}'* && -z $IMAGE_REF ]]; then
+        die "$EX_CONFIG" "manifest uses {image} but no image is resolvable (image recipe or LTE_IMAGE)"
+    fi
+    s=${s//\{repo\}/$REPO_ROOT}
+    s=${s//\{config\}/$CONFIG_DIR}
+    s=${s//\{engine\}/$ENGINE_DIR}
+    s=${s//\{image\}/$IMAGE_REF}
+    SUBST=$s
+}
+
+split_argv() {   # manifest argv string -> ARGV (substituted)
+    local i
+    ARGV=()
+    read -r -a ARGV <<<"$1"
+    for i in "${!ARGV[@]}"; do subst "${ARGV[i]}"; ARGV[i]=$SUBST; done
+}
+
+find_exe() {   # find_exe <name> <strict|prefer> -> EXE ; returns 1 if absent
+    EXE=""
+    if [[ $1 == */* ]]; then
+        [[ -f $1 && -x $1 ]] && EXE=$1
+    elif [[ -f $NATIVE_BIN_DIR/$1 && -x $NATIVE_BIN_DIR/$1 ]]; then
+        EXE=$NATIVE_BIN_DIR/$1
+    elif [[ $2 == prefer ]]; then
+        EXE=$(command -v -- "$1" 2>/dev/null) || EXE=""
+    fi
+    [[ -n $EXE ]]
+}
+
+runtime_env_lines() {   # manifest env for the active runtime -> ENV_LINES
+    ENV_LINES=(${ENV_ALL[@]+"${ENV_ALL[@]}"})
+    if [[ $RUNTIME == docker ]]; then
+        ENV_LINES+=(${ENV_DOCKER[@]+"${ENV_DOCKER[@]}"})
+    else
+        ENV_LINES+=(${ENV_NATIVE[@]+"${ENV_NATIVE[@]}"})
+    fi
+}
+
+export_context() {
+    local kv
+    export LTE_REPO_ROOT="$REPO_ROOT" LTE_CONFIG_DIR="$CONFIG_DIR" \
+        LTE_ENGINE_DIR="$ENGINE_DIR" LTE_RUNTIME="$RUNTIME"
+    if [[ -n $IMAGE_REF ]]; then export LTE_IMAGE="$IMAGE_REF"; fi
+    runtime_env_lines
+    for kv in ${ENV_LINES[@]+"${ENV_LINES[@]}"}; do
+        subst "$kv"
+        export "$SUBST"
+    done
+}
+
+launch() {
+    if [[ -n ${LTE_DRY_RUN:-} || -n ${LTE_DEBUG:-} ]]; then
+        { printf 'lte: cwd %q\nlte: exec' "$PWD"; printf ' %q' "$@"; printf '\n'; } >&2
+    fi
+    if [[ -n ${LTE_DRY_RUN:-} ]]; then exit 0; fi
+    exec "$@"
+}
+
+run_host() {   # run_host <cmd-index> [args...]
+    local i=$1 mode=prefer
+    shift
+    [[ $RUNTIME == native ]] && mode=strict
+    split_argv "${CMD_ARGV[i]}"
+    if ! find_exe "${ARGV[0]}" "$mode"; then
+        if [[ $mode == strict ]]; then
+            die "$EX_UNAVAILABLE" "native runtime: '${ARGV[0]}' not found in LTE_NATIVE_BIN_DIR=$NATIVE_BIN_DIR"
+        fi
+        die "$EX_UNAVAILABLE" "'${ARGV[0]}' not found on PATH (needed by: lte ${CMD_NAMES[i]})"
+    fi
+    ARGV[0]=$EXE
+    export_context
+    cd -- "$RUN_CWD"
+    launch "${ARGV[@]}" "$@"
+}
+
+require_docker() {
+    command -v -- "$DOCKER" >/dev/null 2>&1 ||
+        die "$EX_UNAVAILABLE" "'$DOCKER' not found (install Docker, or set LTE_RUNTIME=native)"
+}
+
+require_image() {
+    [[ -n $IMAGE_REF ]] || die "$EX_CONFIG" "no runtime image: manifest has no image recipe and LTE_IMAGE is unset"
+    "$DOCKER" image inspect "$IMAGE_REF" >/dev/null 2>&1 ||
+        die "$EX_UNAVAILABLE" "runtime image $IMAGE_REF not present (never pulled implicitly); run: lte self build"
+}
+
+selinux_suffix() {
+    case ${LTE_SELINUX_RELABEL:-auto} in
+        auto)
+            SEL=""
+            if [[ -r /sys/fs/selinux/enforce && $(cat /sys/fs/selinux/enforce 2>/dev/null) == 1 ]]; then SEL=",z"; fi ;;
+        z) SEL=",z" ;;
+        none) SEL="" ;;
+        *) die "$EX_CONFIG" "LTE_SELINUX_RELABEL must be auto|z|none" ;;
+    esac
+}
+
+add_mount() {   # add_mount <label> <host-path> <ro|rw>   (identity mount)
+    local m
+    check_mount_path "$1" "$2"
+    for m in ${MOUNT_DSTS[@]+"${MOUNT_DSTS[@]}"}; do
+        if [[ $m == "$2" ]]; then return 0; fi
+    done
+    MOUNT_DSTS+=("$2")
+    RUN+=(--volume "$2:$2:$3$SEL")
+}
+
+identity_opts() {   # host uid:gid (+ supplementary groups); root -> repo owner
+    local uid gid g
+    uid=$(id -u)
+    gid=$(id -g)
+    if [[ $uid == 0 ]]; then
+        read -r uid gid <<<"$(ls -dn -- "$REPO_ROOT" | awk '{print $3, $4}')"
+        RUN+=(--user "$uid:$gid")
+        return 0
+    fi
+    RUN+=(--user "$uid:$gid")
+    for g in $(id -G); do
+        if [[ $g != "$gid" ]]; then RUN+=(--group-add "$g"); fi
+    done
+}
+
+resolve_git_identity() {   # container has no ~/.gitconfig: resolve on host
+    local v
+    if [[ -z ${GIT_AUTHOR_NAME:-} ]]; then
+        v=$(cd -- "$REPO_ROOT" && git config user.name 2>/dev/null) || v=""
+        if [[ -n $v ]]; then export GIT_AUTHOR_NAME="$v"; fi
+    fi
+    if [[ -z ${GIT_AUTHOR_EMAIL:-} ]]; then
+        v=$(cd -- "$REPO_ROOT" && git config user.email 2>/dev/null) || v=""
+        if [[ -n $v ]]; then export GIT_AUTHOR_EMAIL="$v"; fi
+    fi
+    if [[ -z ${GIT_COMMITTER_NAME:-} && -n ${GIT_AUTHOR_NAME:-} ]]; then
+        export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+    fi
+    if [[ -z ${GIT_COMMITTER_EMAIL:-} && -n ${GIT_AUTHOR_EMAIL:-} ]]; then
+        export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+    fi
+}
+
+build_container_run() {   # build_container_run <placement> <argv-string> <label>
+    local place=$1 net=none cas_mode=ro common name kv
+    local -a safe_dirs=("$REPO_ROOT")
+    [[ $place == *+net* ]] && net=${LTE_DOCKER_NETWORK:-bridge}
+    [[ $place == *+cas-rw* ]] && cas_mode=rw
+    selinux_suffix
+    split_argv "$2"
+    RUN=(run --rm --init --interactive)
+    if [[ -t 0 && -t 1 ]]; then RUN+=(--tty); fi
+    identity_opts
+    RUN+=(--read-only --tmpfs "/tmp:rw,nosuid,nodev,size=1g"
+        --security-opt no-new-privileges --cap-drop ALL
+        --network "$net" --workdir "$RUN_CWD"
+        --label "io.lte.repo=$REPO_ROOT" --label "io.lte.command=$3")
+
+    MOUNT_DSTS=()
+    add_mount "repo root" "$REPO_ROOT" rw
+    add_mount "config dir" "$CONFIG_DIR" ro
+    if [[ $ENGINE_DIR != "$REPO_ROOT" ]]; then add_mount "engine dir" "$ENGINE_DIR" ro; fi
+    if [[ -f $REPO_ROOT/.git ]]; then   # linked worktree: object store lives elsewhere
+        common=$(cd -- "$REPO_ROOT" && git rev-parse --git-common-dir 2>/dev/null) || common=""
+        if [[ -n $common ]]; then
+            common=$(cd -- "$REPO_ROOT" && physical_dir "$common") || common=""
+        fi
+        if [[ -n $common ]] && ! under "$common" "$REPO_ROOT"; then
+            add_mount "git common dir" "$common" rw
+            safe_dirs+=("$common")
+        fi
+    fi
+    if [[ -n ${CAS_REPO:-} ]]; then
+        CAS_REPO=${CAS_REPO%/}
+        [[ $CAS_REPO == /* ]] || die "$EX_CONFIG" "CAS_REPO must be an absolute path: $CAS_REPO"
+        [[ -d $CAS_REPO ]] || die "$EX_CONFIG" "CAS_REPO does not exist: $CAS_REPO"
+        add_mount "CAS_REPO" "$CAS_REPO" "$cas_mode"
+        safe_dirs+=("$CAS_REPO")
+    fi
+
+    RUN+=(--env HOME=/tmp --env TMPDIR=/tmp
+        --env "LTE_REPO_ROOT=$REPO_ROOT" --env "LTE_CONFIG_DIR=$CONFIG_DIR"
+        --env "LTE_ENGINE_DIR=$ENGINE_DIR" --env LTE_RUNTIME=docker
+        --env "LTE_IMAGE=$IMAGE_REF" --env "LTE_COMMAND=$3")
+    runtime_env_lines
+    for kv in ${ENV_LINES[@]+"${ENV_LINES[@]}"}; do
+        subst "$kv"
+        RUN+=(--env "$SUBST")
+    done
+    RUN+=(--env "GIT_CONFIG_COUNT=${#safe_dirs[@]}")
+    for kv in "${!safe_dirs[@]}"; do
+        RUN+=(--env "GIT_CONFIG_KEY_$kv=safe.directory" --env "GIT_CONFIG_VALUE_$kv=${safe_dirs[kv]}")
+    done
+    resolve_git_identity
+    for name in $DEFAULT_PASSTHROUGH ${PASS_NAMES[@]+"${PASS_NAMES[@]}"} ${LTE_ENV_PASSTHROUGH:-}; do
+        [[ $name =~ $RE_NAME ]] || die "$EX_CONFIG" "invalid passthrough variable name: $name"
+        if [[ -n ${!name+x} ]]; then RUN+=(--env "$name"); fi   # value from env, not argv
+    done
+    RUN+=(--entrypoint "${ARGV[0]}" "$IMAGE_REF")
+    if ((${#ARGV[@]} > 1)); then RUN+=("${ARGV[@]:1}"); fi
+}
+
+run_container() {   # run_container <cmd-index> [args...]
+    local i=$1
+    shift
+    require_docker
+    require_image
+    build_container_run "${CMD_PLACE[i]}" "${CMD_ARGV[i]}" "${CMD_NAMES[i]}"
+    launch "$DOCKER" "${RUN[@]}" "$@"
+}
+
+# ============================================================== self commands
+engine_version() {
+    ENGINE_VERSION=$(cd -- "$ENGINE_DIR" && git describe --tags --always --dirty 2>/dev/null) ||
+        ENGINE_VERSION="unknown"
+}
+
+self_version() {
+    engine_version
+    printf 'lte-wrapper  %s (contract %s)\n' "$LTE_WRAPPER_VERSION" "$LTE_CONTRACT"
+    printf 'repo         %s\n' "$REPO_ROOT"
+    printf 'engine       %s (%s)\n' "$ENGINE_DIR" "$ENGINE_VERSION"
+    printf 'runtime      %s%s\n' "$RUNTIME" "${IMAGE_REF:+  image=$IMAGE_REF}"
+}
+
+self_env() {
+    local kv
+    engine_version
+    printf 'LTE_WRAPPER_VERSION=%q\nLTE_CONTRACT=%q\n' "$LTE_WRAPPER_VERSION" "$LTE_CONTRACT"
+    printf 'LTE_REPO_ROOT=%q\nLTE_CONFIG_DIR=%q\nLTE_ENGINE_DIR=%q\n' "$REPO_ROOT" "$CONFIG_DIR" "$ENGINE_DIR"
+    printf 'LTE_ENGINE_VERSION=%q\nLTE_MANIFEST=%q\nLTE_ENV_FILE=%q\n' "$ENGINE_VERSION" "$MANIFEST" "${ENV_FILE_LOADED:-}"
+    printf 'LTE_RUNTIME=%q\nLTE_IMAGE=%q\nLTE_NATIVE_BIN_DIR=%q\nLTE_RUN_CWD=%q\n' \
+        "$RUNTIME" "$IMAGE_REF" "$NATIVE_BIN_DIR" "$RUN_CWD"
+    printf 'CAS_REPO=%q\nCAS_BRANCH=%q\n' "${CAS_REPO:-}" "${CAS_BRANCH:-}"
+    runtime_env_lines
+    for kv in ${ENV_LINES[@]+"${ENV_LINES[@]}"}; do
+        subst "$kv"
+        printf '%s=%q\n' "${SUBST%%=*}" "${SUBST#*=}"
+    done
+}
+
+self_doctor() {
+    local fails=0 warns=0 i f docker_ok=0
+    ok()   { printf '  ok    %s\n' "$*"; }
+    wrn()  { printf '  warn  %s\n' "$*"; warns=$((warns + 1)); }
+    bad()  { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+    engine_version
+    printf 'lte doctor  (wrapper %s, contract %s)\n' "$LTE_WRAPPER_VERSION" "$LTE_CONTRACT"
+    ok "repo $REPO_ROOT"
+    ok "config $CONFIG_DIR${ENV_FILE_LOADED:+  (+ $ENV_FILE_NAME)}"
+    for f in ${REQ_CONFIG[@]+"${REQ_CONFIG[@]}"}; do
+        if [[ -f $CONFIG_DIR/$f ]]; then ok "config/$f"; else bad "config/$f missing"; fi
+    done
+    ok "engine $ENGINE_DIR ($ENGINE_VERSION)"
+    if (cd -- "$ENGINE_DIR" && git describe --tags --exact-match >/dev/null 2>&1); then
+        ok "engine pinned on a tag"
+    else
+        wrn "engine HEAD is not exactly on a tag (unreleased pin)"
+    fi
+    [[ $ENGINE_VERSION != *-dirty ]] || wrn "engine working tree is dirty"
+
+    if [[ $RUNTIME == docker ]]; then
+        if ! command -v -- "$DOCKER" >/dev/null 2>&1; then
+            bad "'$DOCKER' not on PATH"
+        elif ! "$DOCKER" info >/dev/null 2>&1; then
+            bad "docker daemon unreachable (permissions? docker group?)"
+        elif [[ -z $IMAGE_REF ]]; then
+            bad "no runtime image resolvable"
+        elif ! "$DOCKER" image inspect "$IMAGE_REF" >/dev/null 2>&1; then
+            bad "image $IMAGE_REF absent -> lte self build"
+        else
+            ok "image $IMAGE_REF"
+            docker_ok=1
+        fi
+    else
+        if [[ -d $NATIVE_BIN_DIR ]]; then ok "native bin dir $NATIVE_BIN_DIR"; else bad "native bin dir missing: $NATIVE_BIN_DIR"; fi
+    fi
+
+    for i in "${!CMD_NAMES[@]}"; do
+        split_argv "${CMD_ARGV[i]}"
+        if [[ ${CMD_PLACE[i]} == host || $RUNTIME == native ]]; then
+            local mode=prefer
+            [[ $RUNTIME == native ]] && mode=strict
+            if find_exe "${ARGV[0]}" "$mode"; then ok "cmd ${CMD_NAMES[i]} -> $EXE"
+            else bad "cmd ${CMD_NAMES[i]}: '${ARGV[0]}' not found"; fi
+        else
+            ok "cmd ${CMD_NAMES[i]} -> container (${CMD_PLACE[i]})"
+        fi
+    done
+
+    if [[ -z ${CAS_REPO:-} ]]; then
+        wrn "CAS_REPO unset (ingest / compile --source cas need it)"
+    elif [[ ! -d $CAS_REPO ]]; then
+        bad "CAS_REPO missing: $CAS_REPO"
+    elif [[ $(git --git-dir="$CAS_REPO" rev-parse --is-bare-repository 2>/dev/null) != true ]]; then
+        bad "CAS_REPO is not a bare git repository: $CAS_REPO"
+    else
+        ok "CAS_REPO $CAS_REPO"
+    fi
+
+    for i in ${PROBE_PLACE[@]+"${!PROBE_PLACE[@]}"}; do
+        if [[ ${PROBE_PLACE[i]} == container && $RUNTIME == docker ]]; then
+            if ((docker_ok)); then
+                build_container_run container "${PROBE_ARGV[i]}" probe
+                if "$DOCKER" "${RUN[@]}" </dev/null >/dev/null 2>&1; then ok "probe container: ${PROBE_ARGV[i]}"
+                else bad "probe container: ${PROBE_ARGV[i]}"; fi
+            else
+                wrn "probe container skipped (no usable image)"
+            fi
+        else
+            local pmode=prefer
+            [[ $RUNTIME == native ]] && pmode=strict
+            split_argv "${PROBE_ARGV[i]}"
+            if find_exe "${ARGV[0]}" "$pmode" &&
+                (ARGV[0]=$EXE; export_context; cd -- "$RUN_CWD" && "${ARGV[@]}") </dev/null >/dev/null 2>&1; then
+                ok "probe ${PROBE_PLACE[i]}: ${PROBE_ARGV[i]}"
+            else
+                bad "probe ${PROBE_PLACE[i]}: ${PROBE_ARGV[i]}"
+            fi
+        fi
+    done
+    selinux_suffix
+    ok "selinux relabel: ${SEL:-off}"
+    printf '%d failure(s), %d warning(s)\n' "$fails" "$warns"
+    ((fails == 0))
+}
+
+self_build() {
+    if [[ $RUNTIME != docker ]]; then
+        printf 'lte: runtime=%s: no runtime image to build\n' "$RUNTIME"
+        exit 0
+    fi
+    [[ -n $IMAGE_DOCKERFILE ]] || die "$EX_CONFIG" "manifest has no image-dockerfile"
+    [[ -n $IMAGE_REF ]] || die "$EX_CONFIG" "no image reference resolvable"
+    require_docker
+    launch "$DOCKER" build --tag "$IMAGE_REF" --file "$ENGINE_DIR/$IMAGE_DOCKERFILE" \
+        --label "io.lte.contract=$LTE_CONTRACT" --label "io.lte.runtime-key=${RUNTIME_KEY:-external}" \
+        "$@" "$ENGINE_DIR"
+}
+
+# ============================================================== main
+usage() {
+    cat <<'EOF'
+usage: lte [-C <dir>] <command> [args...]
+       lte self version | env | doctor | build [docker-build-args...]
+       lte -h | --help | -V | --version
+EOF
+}
+
+list_commands() {
+    local i
+    printf '\ncommands (engine %s):\n' "$ENGINE_DIR"
+    for i in "${!CMD_NAMES[@]}"; do
+        printf '  %-12s %-18s %s\n' "${CMD_NAMES[i]}" "${CMD_PLACE[i]}" "${CMD_ARGV[i]}"
+    done
+}
+
+main() {
+    local sub i
+    while (($#)); do
+        case $1 in
+            -C)
+                (($# >= 2)) || die "$EX_USAGE" "-C requires a directory"
+                cd -- "$2" 2>/dev/null || die "$EX_CONFIG" "cannot change directory: $2"
+                shift 2 ;;
+            -h | --help | help)
+                usage
+                (resolve_all && list_commands) 2>/dev/null || true
+                exit 0 ;;
+            -V | --version)
+                printf 'lte-wrapper %s (contract %s)\n' "$LTE_WRAPPER_VERSION" "$LTE_CONTRACT"
+                exit 0 ;;
+            --) shift; break ;;
+            -*) die "$EX_USAGE" "unknown option: $1 (see: lte --help)" ;;
+            *) break ;;
+        esac
+    done
+    if (($# == 0)); then
+        usage >&2
+        exit "$EX_USAGE"
+    fi
+    sub=$1
+    shift
+    resolve_all
+
+    if [[ $sub == self ]]; then
+        case ${1:-} in
+            version) self_version ;;
+            env) self_env ;;
+            doctor) self_doctor ;;
+            build) shift; self_build "$@" ;;
+            *) die "$EX_USAGE" "usage: lte self version|env|doctor|build" ;;
+        esac
+        exit
+    fi
+
+    for i in "${!CMD_NAMES[@]}"; do
+        if [[ ${CMD_NAMES[i]} == "$sub" ]]; then
+            if [[ ${CMD_PLACE[i]} == host || $RUNTIME == native ]]; then
+                run_host "$i" "$@"
+            else
+                run_container "$i" "$@"
+            fi
+        fi
+    done
+    die "$EX_USAGE" "unknown command '$sub' (engine $ENGINE_DIR declares: ${CMD_NAMES[*]})"
+}
+
+main "$@"

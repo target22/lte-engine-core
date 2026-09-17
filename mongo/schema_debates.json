@@ -1,0 +1,121 @@
+{
+  "$jsonSchema": {
+    "bsonType": "object",
+    "title": "debates collection validator — Layer 2 (TECHNICAL/POLICY DEBATE) & Layer 3 (OPERATIONAL EXTENSIONS/EXECUTION CHECKLIST)",
+    "description": "One document per Reference Callout ([!ref-domain-xxx] or [!ops-domain-xxx]). Mirrors scripts/graph_lib.py's RefCallout dataclass, plus fields (nodes_involved, decision, hash_chain) the current flat-file parser has no equivalent for -- see the migration note on 'decision' below and in mongo/aggregation_facade.js for exactly how that gap is closed during a Mongo migration.",
+    "required": ["debate_id", "document_id", "target_anchor_id", "layer", "body", "nodes_involved", "decision", "metadata", "hash_chain"],
+    "additionalProperties": false,
+    "properties": {
+      "_id": {
+        "bsonType": "objectId"
+      },
+      "debate_id": {
+        "bsonType": "string",
+        "minLength": 1,
+        "description": "Stable id for this callout, e.g. 'sales-001-debate-0'. Convention: '<target_anchor_id>-<layer_short>-<index>', where layer_short is 'debate' or 'exec' and index is 0-based per (target_anchor_id, layer, locale) -- deliberately close to, but not identical to, scripts/parse_graph.py's generated DOM id ('debate-<lang>-<partition>-<documentId>-<targetId>-<kind>-<idx>'), since a Mongo _id-adjacent identifier doesn't need a full document path baked into a stable id the way a per-page DOM id does."
+      },
+      "document_id": {
+        "bsonType": "string",
+        "minLength": 1,
+        "description": "The Tier 2 document this callout is AUTHORED IN -- in the normal case, identical to target_anchor_id's own node.document_id, since a callout is nested visually under its target within the SAME document's dual-pane view (requirement 4, Stage 2: 'linked to the selected Document's nodes'). IMPORTANT ARCHITECTURAL CONSEQUENCE, not silently absorbed: scripts/parse_graph.py's Tier 3 nesting is strictly document-scoped in this revision -- if a callout's target_anchor_id belongs to a DIFFERENT document than the one it's authored in, parse_graph.py does not nest it under any node in public/graph.json at all (there is no cross-document nesting slot in the 3-tier shape to put it in). scripts/validate_markdown.py still catches it as a referential-integrity PASS if the anchor exists anywhere in the corpus, and a genuine orphan if it doesn't either way -- but a 'valid but cross-document' reference is currently invisible in the rendered UI, which is a real, stated limitation of the 3-tier model versus the prior flat one, not a bug being quietly worked around."
+      },
+      "target_anchor_id": {
+        "bsonType": "string",
+        "pattern": "^(spec|adr|sop|exec|adrint|opsint|coreint)-[0-9]+$",
+        "description": "The anchor this callout targets. MAY belong to a different domain than nodes_involved's other entries or this document's own likely partition -- cross-partition references are valid by design, see scripts/graph_lib.py's find_orphan_refs() docstring. NOT required to reference an existing nodes document at the schema level (MongoDB $jsonSchema cannot express a foreign-key constraint) -- referential integrity is an application-layer / migration-time check, mirroring scripts/validate_markdown.py's role in the file-based system."
+      },
+      "layer": {
+        "bsonType": "string",
+        "enum": ["debate", "execution"],
+        "description": "'debate' = TECHNICAL DEBATE / POLICY DEBATE, sourced from a [!ref-domain-xxx] callout. 'execution' = OPERATIONAL EXTENSIONS / EXECUTION CHECKLIST, sourced from a [!ops-domain-xxx] callout."
+      },
+      "body": {
+        "bsonType": "object",
+        "required": ["markdown", "html"],
+        "additionalProperties": false,
+        "properties": {
+          "markdown": {
+            "bsonType": "string",
+            "description": "Raw blockquote body (leading '>' markers already stripped), byte-identical to scripts/graph_lib.py's RefCallout.content."
+          },
+          "html": {
+            "bsonType": "string",
+            "description": "Server-rendered HTML, byte-identical to scripts/parse_graph.py's render() output for this callout."
+          }
+        }
+      },
+      "nodes_involved": {
+        "bsonType": "array",
+        "minItems": 1,
+        "items": {
+          "bsonType": "string",
+          "pattern": "^(spec|adr|sop|exec|adrint|opsint|coreint)-[0-9]+$"
+        },
+        "description": "Every anchor this callout substantively compares. Always includes target_anchor_id at minimum. The current flat-file authoring layer has no syntax for naming a SECOND anchor explicitly (a debate's title names alternatives by prose label, e.g. 'Option A (I) vs Option C (You)', not by a second ^anchor-id) -- for content ingested from today's parser, nodes_involved is always exactly [target_anchor_id]. This field is forward-looking: it exists so a future authoring syntax extension (or direct Mongo authoring) can name multiple anchors per debate without a schema migration."
+      },
+      "decision": {
+        "bsonType": "object",
+        "required": ["title", "outcome"],
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "bsonType": "string",
+            "minLength": 1,
+            "description": "The callout's title text verbatim, e.g. 'Option A (I) vs Option C — chosen (You)'. The flat-file layer encodes which option 'won' as a PROSE convention inside this string (the parenthetical '(You)' / '— chosen' marks it) -- 'outcome' below is the normalized, machine-readable equivalent of that same fact."
+          },
+          "outcome": {
+            "bsonType": "string",
+            "enum": ["accepted", "rejected", "superseded", "undecided"],
+            "description": "Normalized decision status. NOT INFERRABLE by scripts/parse_graph.py today -- the parser only captures title/body text, it does not parse the 'chosen' convention out of a title string. Migration note (see mongo/aggregation_facade.js): a one-time backfill pass over existing content, either manual per-file review or an LLM-assisted classification pass reading each callout's own title/body, is required to populate this field for anything ingested from the current flat-file corpus. Until that backfill runs, an ingestion script should default 'debate' layer callouts to 'undecided' and 'execution' layer callouts to 'accepted' (an execution checklist's existence already implies its parent decision was accepted) rather than guess a specific accepted/rejected split it cannot support from today's data."
+          }
+        }
+      },
+      "metadata": {
+        "bsonType": "object",
+        "required": ["source_file", "partition", "locale"],
+        "additionalProperties": false,
+        "properties": {
+          "source_file": {
+            "bsonType": "string"
+          },
+          "partition": {
+            "bsonType": "string",
+            "enum": ["core", "adr", "ops", "exec", "adr-internal", "ops-internal", "core-internal"],
+            "description": "The partition of the FILE this callout was authored in -- not necessarily the same partition as target_anchor_id's domain, for a cross-partition reference."
+          },
+          "locale": {
+            "bsonType": "string",
+            "enum": ["vi", "en"]
+          },
+          "line_no": {
+            "bsonType": ["int", "null"],
+            "minimum": 1
+          }
+        }
+      },
+      "hash_chain": {
+        "bsonType": "object",
+        "required": ["sequence", "timestamp", "prev_hash", "hash"],
+        "additionalProperties": false,
+        "description": "Identical shape and semantics to mongo/schema_nodes.json's hash_chain -- same GLOBAL sequence, shared across both collections. See that file's field-level comments; not repeated here to avoid the two schemas drifting out of sync in prose while their actual bsonType/pattern constraints (which DO need to be literally duplicated, since MongoDB validators can't $ref another collection's schema) stay identical below.",
+        "properties": {
+          "sequence": {
+            "bsonType": "long",
+            "minimum": 0
+          },
+          "timestamp": {
+            "bsonType": "date"
+          },
+          "prev_hash": {
+            "bsonType": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "hash": {
+            "bsonType": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    }
+  }
+}

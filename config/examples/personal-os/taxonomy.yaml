@@ -1,0 +1,6 @@
+config_version: "1.0.0"
+partitions:
+  - {id: philosophy, label: "01 · Philosophy", domain: phil, codeowner: "@me", scope: open, flavor: meta}
+  - {id: infrastructure, label: "02 · Infrastructure", domain: infra, codeowner: "@me", scope: open, flavor: kernel}
+  - {id: evidence, label: "03 · Evidence", domain: evid, codeowner: "@me", scope: vault, flavor: policy}
+  - {id: releases, label: "04 · Releases", domain: rel, codeowner: "@me", scope: open, flavor: kernel}

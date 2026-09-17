@@ -1,0 +1,284 @@
+# =============================================================================
+# shared_toolset_config.yaml
+# =============================================================================
+# One file, N tools, ZERO shared keys.
+#
+# ISOLATION CONTRACT
+#   Each top-level key is a namespace owned by exactly one tool. A tool reads
+#   its own namespace by literal constant (`skeleton_extractor.NAMESPACE`) and
+#   returns only that subtree; it is structurally incapable of reading a
+#   sibling's settings. Two consequences that are deliberate, not accidental:
+#
+#   1. NO SHARED `defaults:` BLOCK. A merged block would mean editing one
+#      tool's default silently changes another tool's behaviour, with no
+#      import edge or call site to make the coupling visible in review.
+#      Duplicated `exclude_dirs` across namespaces is the cheaper failure.
+#
+#   2. NO CROSS-NAMESPACE ANCHORS. YAML anchors (`&name` / `*name`) would
+#      reintroduce exactly the coupling removed in (1), just at parse time
+#      instead of merge time. Keys are repeated in full, on purpose.
+#
+#   Each tool validates its own namespace against a declared key surface and
+#   HARD-FAILS on an undeclared key. A typo'd key is never silently ignored --
+#   "the setting had no effect" is the most expensive config bug to diagnose.
+# =============================================================================
+
+
+# -----------------------------------------------------------------------------
+# NAMESPACE 1 -- skeleton_extractor.py
+# Structural extraction for context-window-bounded code review.
+# -----------------------------------------------------------------------------
+skeleton_extractor:
+
+  # Extension allow-list. An extension absent here is never read at all --
+  # this is the discovery filter, not merely an extractor-selection hint.
+  supported_extensions:
+    - .py
+    - .js
+    - .ts
+    - .jsx
+    - .tsx
+    - .java
+    - .yaml
+    - .yml
+    - .json
+#    - .md
+
+  # Matched against a directory NAME at any depth, pruned before descent.
+  exclude_dirs:
+    - .git
+    - .cas
+    - .cache
+    - .venv
+    - venv
+    - __pycache__
+    - node_modules
+    - dist
+    - build
+    - .pytest_cache
+    - .mypy_cache
+    - htmlcov
+    - site-packages
+    - node_modules
+    - out
+    - drafts
+    - docs
+    - scripts
+    - scripts_not_in_use
+    - examples
+
+  # Glob, matched against BOTH the basename and the repo-relative path,
+  # so `*.min.js` and `vendor/*` both behave as written.
+  exclude_files:
+    - "*.min.js"
+    - "*.map"
+    - "*.lock"
+    - "package-lock.json"
+    - "poetry.lock"
+    - "*.generated.*"
+    - "architecture_skeleton.md"      # never re-ingest our own artifact
+    - "graph.json"                    # compiled read-model, not source
+    - "graph-internal.json"
+
+  python:
+    # Docstrings are the highest signal-per-byte content in a skeleton: they
+    # state intent, which a signature cannot. Kept, but capped.
+    preserve_docstrings: true
+    max_docstring_lines: 3
+    # Import blocks ARE structure -- they are the module's dependency edges,
+    # and the only way a reader can reconstruct the import DAG from a skeleton.
+    include_imports: true
+    # Module-level literals are collapsed to their SHAPE with key names kept,
+    # so a partition table reads as `{ 'core', 'adr', ... }  # dict, 6 key(s)`
+    # rather than three screens of nested values.
+    include_module_constants: true
+    max_constant_keys: 8
+    body_placeholder: "pass"
+
+  brace_languages:
+    # A block whose header matches one of these is a CONTAINER: recursed into,
+    # so member signatures survive. Everything else is an implementation body
+    # and is collapsed. This list is the entire difference between a useful
+    # TypeScript skeleton and a file of bare `class X { ... }` lines.
+    container_patterns:
+      - '\bclass\s+\w+'
+      - '\binterface\s+\w+'
+      - '\benum\s+\w+'
+      - '\bnamespace\s+\w+'
+      - '\bdeclare\s+module\b'
+      - '\bstruct\s+\w+'
+      - '\bimpl\b'
+      - '\btype\s+\w+\s*=\s*\{'
+      # An export list is the module's public surface -- structure, not body.
+      - '^\s*export\s*\{'
+      # Uncomment to retain multi-line object literals (config objects,
+      # Vue/Alpine component definitions). Off by default: this is also
+      # where large data payloads hide.
+      # - '^\s*(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*\{'
+      # - '^\s*export\s+default\s*\{'
+    body_placeholder: "/* ... */"
+    preserve_comments: false
+    # Module-wrapper safety valve. A block spanning more than this fraction of
+    # the file is treated as a container and recursed into, regardless of the
+    # patterns above. Without it, a file whose entire body sits inside one
+    # top-level factory function (Alpine/jQuery component, IIFE) collapses to a
+    # single line and the skeleton silently reports 0% retained as a success.
+    max_collapse_ratio: 0.5
+
+  # Applies to .yaml/.yml (line-oriented) and .json (parse-based).
+  structured_data:
+    max_scalar_chars: 80
+    max_sequence_items: 5
+    max_block_scalar_lines: 0
+
+  markdown:
+    # Lines matching any of these are retained alongside headings. The tool
+    # ships NO knowledge of any corpus grammar -- the grammar lives here, so
+    # the extractor stays a stateless processor. Below: AST admonition
+    # openers, trailing anchor IDs, and reference links.
+    structural_patterns:
+      - '^\s*(?:!!!|\?\?\?\+?)\s+\w+'
+      - '\^[a-z]+-[a-z0-9-]+-\d+-\d+\s*$'
+      - '^\s*>\s*\[!ref-[a-z0-9-]+\]'
+      - '^---\s*$'
+      - '^\s*\w[\w -]*:\s'
+    preserve_fenced_languages: true
+
+  # Used for any supported extension with no dedicated extractor.
+  fallback:
+    head_lines: 5
+    tail_lines: 0
+
+  output:
+    path: "architecture_skeleton.md"
+    annotate_elisions: true       # emit `<... N lines elided>` markers
+    emit_diagnostics: true        # degraded-file table
+    emit_size_table: true         # per-file context budget table
+
+
+# -----------------------------------------------------------------------------
+# NAMESPACE 2 -- arch_tree_generator.py
+# Annotated ASCII directory tree of the whole repository.
+# -----------------------------------------------------------------------------
+# Same isolation contract, different key. Note that `exclude_dirs` diverges
+# from the extractor's list: the tree SHOWS `.github/` and `docs/` because
+# "what exists and where" is the question it answers, while the extractor
+# skips anything it cannot usefully skeletonise. One shared list would force
+# one of the two tools to be wrong.
+arch_tree_generator:
+
+  exclude_dirs:
+    - .git
+    - .venv
+    - venv
+    - __pycache__
+    - node_modules
+    - .pytest_cache
+    - .mypy_cache
+    - .ruff_cache
+    - htmlcov
+    - site-packages
+    - .cache
+    - node_modules
+    - out
+    - drafts
+    - scripts
+    - scripts_not_in_use
+    - examples
+
+  exclude_files:
+    - "*.pyc"
+    - "*.pyo"
+    - "*.map"
+    - "*.tmp"
+    - ".DS_Store"
+    - "package-lock.json"
+    - "poetry.lock"
+    # This run's OWN output is already skipped in code (main() adds the
+    # resolved output path to `skip`), so the entry below is not what protects
+    # the current run. It matters for the SIBLING tool's artifact and for a
+    # stale tree left at a path this run is not writing -- both of which would
+    # otherwise appear and make two runs incomparable.
+    - "architecture_tree.md"
+    - "architecture_skeleton.md"
+    - "*.md"
+
+  traversal:
+    max_depth: 0                      # 0 = unlimited
+    directories_first: true
+    include_hidden: true              # .github/, .gitignore are structure
+    follow_symlinks: false            # cycle-safe by default
+    max_entries_per_dir: 40           # collapses generated/vendored dumps
+
+  annotations:
+    enabled: true
+    head_bytes: 8192                  # bounded read; annotation is line 1
+    max_chars: 72
+    marker: "#"
+    column: 0                         # 0 = auto-align to widest row
+    max_column: 60                    # cap, so one deep path cannot push
+                                      # every annotation off the right edge
+    markdown_prefer_frontmatter_title: true
+    annotate_directories: true
+    directory_summary_files:
+      - README.md
+      - README.rst
+      - index.md
+
+  output:
+    path: "architecture_tree.md"
+    title: "Architecture Tree"
+    emit_summary: true
+
+# -----------------------------------------------------------------------------
+# NAMESPACE 3 -- dependency_auditor.py  (third tool, strictly isolated)
+# Import-graph and third-party dependency analysis.
+# -----------------------------------------------------------------------------
+# Note the deliberate overlap: `exclude_dirs` appears in BOTH namespaces with
+# DIFFERENT values. The auditor must descend into `.venv/` to resolve installed
+# distributions; the extractor must not, or the skeleton fills with vendored
+# code. Sharing one list would force one tool to be wrong. This divergence is
+# the isolation contract doing its job, not configuration drift.
+dependency_auditor:
+
+  manifest_files:
+    - requirements.txt
+    - pyproject.toml
+    - package.json
+    - go.mod
+
+  # Intentionally NOT the extractor's list -- see note above.
+  exclude_dirs:
+    - .git
+    - node_modules
+    - dist
+
+  resolution:
+    follow_transitive: true
+    max_depth: 4
+    unresolved_is_error: true
+
+  policy:
+    # Layer ordering mirrors the package's import contract. An edge that
+    # points upward is a violation.
+    layer_order:
+      - runner
+      - engine
+      - io
+      - validators
+      - cli
+    allowed_licenses:
+      - MIT
+      - BSD-3-Clause
+      - Apache-2.0
+      - PSF-2.0
+    forbidden_imports:
+      - from: "lte.runner"
+        to: "lte.engine"
+        reason: >-
+          runner targets the 3.5/3.6 host; engine targets 3.9+.
+          The edge is a SyntaxError at import time, not a style issue.
+
+  output:
+    path: "dependency_audit.md"
+    fail_on_violation: true

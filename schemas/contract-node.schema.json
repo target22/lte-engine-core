@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://logic-trace-engine.internal/schemas/contract-node.schema.json",
+  "title": "Logic Trace Engine Contract Node",
+  "description": "A single KERNEL_CONTRACT / POLICY_CONTRACT node, as emitted by scripts/parse_graph.py",
+  "type": "object",
+  "required": ["anchor_id", "title", "layer", "body", "debates", "ops"],
+  "additionalProperties": false,
+  "properties": {
+    "anchor_id": {
+      "type": "string",
+      "pattern": "^[a-z]+(-[a-zA-Z0-9]+)+$",
+      "description": "Domain-prefixed anchor, e.g. spec-fp-01-001. No leading '^' -- that's authoring syntax only."
+    },
+    "title": { "type": "string", "minLength": 1 },
+    "layer": {
+      "type": "string",
+      "enum": ["KERNEL_CONTRACT", "POLICY_CONTRACT"]
+    },
+    "body": { "type": "string", "description": "Pre-rendered HTML, not raw Markdown." },
+    "debates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/calloutEntry" }
+    },
+    "ops": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/calloutEntry" }
+    }
+  },
+  "$defs": {
+    "calloutEntry": {
+      "type": "object",
+      "required": ["title", "body", "source_file", "layer"],
+      "additionalProperties": false,
+      "properties": {
+        "title": { "type": "string" },
+        "body": { "type": "string" },
+        "source_file": {
+          "type": "string",
+          "description": "Repo-relative path of the file this callout was AUTHORED in -- may differ from the node's own document, per the cross-file nesting fix."
+        },
+        "layer": {
+          "type": "string",
+          "enum": ["TECHNICAL_DEBATE", "POLICY_DEBATE", "OPERATIONAL_EXTENSIONS", "EXECUTION_CHECKLIST"]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,129 @@
+# config/ui_projection.yaml
+#
+# TRI-PANE PROJECTION CONTRACT — the mapping from a parsed AST block to
+# (a) which pane renders it and (b) which Layer 1/2/3 label it carries.
+#
+# Replaces three hardcoded ternaries in scripts/graph_lib.py:
+#   contract_layer_of()  -> "KERNEL_CONTRACT" if partition in _KERNEL_FLAVORED_PARTITIONS else "POLICY_CONTRACT"
+#   debate_layer_of()    -> "TECHNICAL_DEBATE" if ... else "POLICY_DEBATE"
+#   ops_layer_of()       -> "OPERATIONAL_EXTENSIONS" if ... else "EXECUTION_CHECKLIST"
+# ...and one in _parse_admonition_block():
+#   kind = "ref" if block_type == "warning" else "ops"
+#
+# SCOPE OF THIS FILE — read this before assuming it drives the UI.
+# The `layer` string emitted into graph.json is what this file controls, and
+# that string IS consumed by the compiler (parse_graph.py:350/397/400 and
+# git_cas.py:591/616/619). The `pane` field below is DESCRIPTIVE: public/app.js
+# does not currently read `layer` at all — it selects panes from the nested
+# document/node/debates/ops structure directly. Changing `pane` here therefore
+# changes documentation, not rendering, until app.js is taught to read it.
+# See 01-AUDIT-FINDINGS.md FINDING 5.
+
+config_version: "1.0.0"
+
+panes:
+  left:
+    role: structural_navigation
+    renders: "Tier 1 partition -> Tier 2 tractate_path -> Tier 3 document tree"
+    source_fields: ["partitions[].id", "partitions[].label", "documents[].tractate_path", "documents[].document_id"]
+    notes: >-
+      tractate_path is structural, not cosmetic: it is the real on-disk
+      subfolder chain beneath docs/<scope>/<partition>/ and drives both the
+      collapsible folder tree here and isolation-by-tractate in the middle pane.
+
+  middle:
+    role: contract_body
+    renders: "Tier 4 contract nodes, plus prologue_html when node_count == 0"
+    layers: ["KERNEL_CONTRACT", "POLICY_CONTRACT"]
+
+  right:
+    role: contextual_annotations
+    renders: "Tier 4 debates and ops/checklist entries, nested under their target contract node"
+    layers: ["TECHNICAL_DEBATE", "POLICY_DEBATE", "OPERATIONAL_EXTENSIONS", "EXECUTION_CHECKLIST"]
+
+# Admonition type -> AST role. `layer_by_flavor` is keyed on the `flavor`
+# field of config/taxonomy.yaml. Every flavor declared there MUST appear in
+# every layer_by_flavor map below; the loader raises ConfigError otherwise,
+# so adding a third flavor can never silently fall through to a default.
+admonitions:
+  note:
+    ast_role: contract
+    emits: node
+    pane: middle
+    layer_by_flavor:
+      kernel: KERNEL_CONTRACT
+      policy: POLICY_CONTRACT
+      # META_CONSTITUTION is the label the brief specified for the axioms
+      # partition. Declared HERE, not in taxonomy.yaml, so that layer
+      # strings have exactly one home.
+      meta: META_CONSTITUTION
+
+  warning:
+    ast_role: debate
+    emits: callout
+    callout_kind: ref
+    pane: right
+    layer_by_flavor:
+      kernel: TECHNICAL_DEBATE
+      policy: POLICY_DEBATE
+      # FLAGGED: the brief specified only the Layer 1 label for axioms.
+      # Layers 2 and 3 below are my choice -- a distinct flavor with a
+      # distinct label triple. Reusing TECHNICAL_DEBATE/OPERATIONAL_
+      # EXTENSIONS instead is equally safe (app.js reads no layer strings
+      # today); confirm which you want.
+      meta: META_DEBATE
+
+  tip:
+    ast_role: ops
+    emits: callout
+    callout_kind: ops
+    pane: right
+    layer_by_flavor:
+      kernel: OPERATIONAL_EXTENSIONS
+      policy: EXECUTION_CHECKLIST
+      meta: META_CHECKLIST
+
+# Grammar 1's top-level blockquote callouts carry their kind in the token
+# itself ([!ref-...] / [!ops-...]) rather than in an enclosing admonition.
+# Mapped here so both grammars resolve a layer label through one table.
+callout_kinds:
+  ref:
+    ast_role: debate
+    pane: right
+    layer_by_flavor:
+      kernel: TECHNICAL_DEBATE
+      policy: POLICY_DEBATE
+      # FLAGGED: the brief specified only the Layer 1 label for axioms.
+      # Layers 2 and 3 below are my choice -- a distinct flavor with a
+      # distinct label triple. Reusing TECHNICAL_DEBATE/OPERATIONAL_
+      # EXTENSIONS instead is equally safe (app.js reads no layer strings
+      # today); confirm which you want.
+      meta: META_DEBATE
+  ops:
+    ast_role: ops
+    pane: right
+    layer_by_flavor:
+      kernel: OPERATIONAL_EXTENSIONS
+      policy: EXECUTION_CHECKLIST
+      meta: META_CHECKLIST
+
+# Document lifecycle projection (Task 2). Declares what the frontend should
+# render for the new frontmatter fields. Nothing reads this yet — it is the
+# contract app.js must implement to make the deprecation banner mechanical
+# instead of inline-text-driven.
+lifecycle:
+  superseded_by:
+    pane: middle
+    render: deprecation_banner
+    banner_severity: warning
+    link_target: document_id
+    notes: >-
+      When non-null, render a banner above the contract body linking to the
+      named document_id. See 01-AUDIT-FINDINGS.md FINDING 4 — document_id is
+      not globally unique across tractates and this reference is NOT validated
+      by the linter, so a dangling link is currently possible.
+  supersedes:
+    pane: middle
+    render: provenance_line
+    banner_severity: info
+    link_target: document_id

@@ -1,0 +1,116 @@
+{
+  "$jsonSchema": {
+    "bsonType": "object",
+    "title": "nodes collection validator — Layer 1 (KERNEL CONTRACT / POLICY CONTRACT)",
+    "description": "One document per Universal Relational Anchor (^spec-xxx, ^adr-xxx, ^sop-xxx, ^exec-xxx, ^adrint-xxx, ^opsint-xxx, ^coreint-xxx). Mirrors scripts/graph_lib.py's SpecNode dataclass field-for-field, plus the hash_chain envelope no file-based node needs today. anchor_id uniqueness and the domain/partition cross-field correlation are enforced by application code and a unique index (see mongo/aggregation_facade.js's header comment), not by this schema — MongoDB's $jsonSchema cannot express either constraint natively.",
+    "required": ["anchor_id", "document_id", "domain", "layer", "title", "body", "metadata", "hash_chain"],
+    "additionalProperties": false,
+    "properties": {
+      "_id": {
+        "bsonType": "objectId"
+      },
+      "anchor_id": {
+        "bsonType": "string",
+        "pattern": "^(spec|adr|sop|exec|adrint|opsint|coreint)-[0-9]+$",
+        "description": "e.g. 'spec-001'. Enforce uniqueness with: db.nodes.createIndex({ anchor_id: 1, 'metadata.locale': 1 }, { unique: true }) — unique per (anchor_id, locale) pair, since the vi and en versions of the same anchor are two documents, not one."
+      },
+      "document_id": {
+        "bsonType": "string",
+        "minLength": 1,
+        "description": "Tier 2 (Document/Tractate) id this node belongs to, e.g. 'pricing-bounds' -- matches scripts/graph_lib.py's document_id_of(): the source filename stem with its '.vi.md'/'.en.md' suffix stripped, identical across the vi and en versions of the same document. Enforce (document_id, domain's partition, locale) as a real foreign key to a documents collection at the application layer if one is introduced -- see the migration note in mongo/aggregation_facade.js on why this delivery keeps 'documents' as a projection over nodes.metadata rather than a fourth physical collection."
+      },
+      "domain": {
+        "bsonType": "string",
+        "enum": ["spec", "adr", "sop", "exec", "adrint", "opsint", "coreint"],
+        "description": "Must equal the prefix of anchor_id before the first hyphen. Not expressible as a schema-level cross-field constraint in MongoDB's $jsonSchema (no regex back-reference to a sibling field) — enforced at write time by application code, mirroring scripts/graph_lib.py's domain_of() / find_misplaced_anchors()."
+      },
+      "layer": {
+        "bsonType": "string",
+        "enum": ["contract"],
+        "description": "Nodes are always Layer 1 (KERNEL CONTRACT / POLICY CONTRACT). A single fixed value, not a free-form field — kept as an explicit enum rather than omitted so a node document and a debates-collection document can be told apart by shape alone even outside their originating collection (e.g. in a merged event-audit view). Layer 2/3 content lives in the debates collection; see mongo/schema_debates.json's own 'layer' enum ('debate' | 'execution')."
+      },
+      "title": {
+        "bsonType": "string",
+        "minLength": 1,
+        "maxLength": 300,
+        "description": "The authoring heading text immediately preceding the anchor line -- matches scripts/graph_lib.py's SpecNode.title exactly."
+      },
+      "body": {
+        "bsonType": "object",
+        "required": ["markdown", "html"],
+        "additionalProperties": false,
+        "properties": {
+          "markdown": {
+            "bsonType": "string",
+            "description": "Raw authored content between the heading and the anchor line, byte-identical to scripts/graph_lib.py's SpecNode.content."
+          },
+          "html": {
+            "bsonType": "string",
+            "description": "Server-rendered HTML, byte-identical to what scripts/parse_graph.py's render() produces via python-markdown — stored pre-rendered so mongo/aggregation_facade.js never needs a markdown renderer of its own to reproduce public/graph.json's shape."
+          }
+        }
+      },
+      "metadata": {
+        "bsonType": "object",
+        "required": ["source_file", "partition", "locale", "document_title", "document_summary"],
+        "additionalProperties": false,
+        "description": "document_title and document_summary are DELIBERATELY DENORMALIZED here (identical across every node sharing the same document_id) rather than split into a fourth 'documents' collection -- this delivery's requirement only specified nodes/debates collections, and Tier 2 (Document) in public/graph.json is a projection computed by GROUPING nodes by document_id (see mongo/aggregation_facade.js's fetchLangGraph()), not a physically separate entity authored on its own. Denormalization means updating a document's title requires a multi-document update across all its nodes -- an accepted tradeoff for a reference corpus that changes by commit, not by high-frequency writes; revisit if that assumption stops holding.",
+        "properties": {
+          "source_file": {
+            "bsonType": "string",
+            "description": "Relative path at ingest time, e.g. 'docs/sales/pricing-bounds.vi.md'. Kept even after the file-based authoring layer is fully retired, as an audit trail back to the originating commit. Identical for every node sharing this node's document_id."
+          },
+          "document_title": {
+            "bsonType": "string",
+            "minLength": 1,
+            "description": "The document's Tier 2 title (the file's own H1 heading at ingest time) -- see scripts/graph_lib.py's extract_document_title(). Identical for every node sharing this node's document_id."
+          },
+          "document_summary": {
+            "bsonType": "string",
+            "description": "Plain-text excerpt for the Stage 1 Document Card grid, matching scripts/parse_graph.py's plain_text_summary() output for this document's first node at ingest time. Identical for every node sharing this node's document_id. May be an empty string only if the document somehow has zero nodes, which should not occur in practice (every document exists because it has at least one anchor)."
+          },
+          "partition": {
+            "bsonType": "string",
+            "enum": ["core", "adr", "ops", "exec", "adr-internal", "ops-internal", "core-internal"],
+            "description": "Enterprise partition id (docs/<scope>/<partition>/) -- see scripts/graph_lib.py's PARTITIONS, the single source of truth this enum mirrors."
+          },
+          "locale": {
+            "bsonType": "string",
+            "enum": ["vi", "en"]
+          },
+          "line_no": {
+            "bsonType": ["int", "null"],
+            "minimum": 1,
+            "description": "1-indexed heading line in source_file at ingest time. Null once a document is authored directly against MongoDB rather than ingested from a file (the file-based authoring layer is not assumed to be permanent)."
+          }
+        }
+      },
+      "hash_chain": {
+        "bsonType": "object",
+        "required": ["sequence", "timestamp", "prev_hash", "hash"],
+        "additionalProperties": false,
+        "description": "See the Hash-Chain Specification in mongo/aggregation_facade.js's header comment (formula, exact byte layout, and reference implementation) and README.md's summary. IMPORTANT: 'sequence' is a SINGLE GLOBAL counter shared across the nodes AND debates collections together, not scoped per collection -- deleting one document from either collection breaks the same chain, which is the entire point of a tamper-evident log spanning more than one collection.",
+        "properties": {
+          "sequence": {
+            "bsonType": "long",
+            "minimum": 0,
+            "description": "Monotonic, gapless, global across nodes+debates. Enforce gaplessness at the application/ingestion layer (a $jsonSchema validator can bound the type and range but cannot verify global monotonicity across collections)."
+          },
+          "timestamp": {
+            "bsonType": "date"
+          },
+          "prev_hash": {
+            "bsonType": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "Hash of the immediately preceding event in the GLOBAL chain (may belong to either collection). For sequence 0 (genesis), this is the constant 64-char all-zero string '0'.repeat(64), never null and never an empty string -- see GENESIS_PREV_HASH in mongo/aggregation_facade.js. A fixed, well-defined genesis value avoids the ambiguity a null/absent prev_hash would introduce for the very first event."
+          },
+          "hash": {
+            "bsonType": "string",
+            "pattern": "^[0-9a-f]{64}$",
+            "description": "SHA-256 hex digest of this event, computed per the Hash-Chain Specification."
+          }
+        }
+      }
+    }
+  }
+}

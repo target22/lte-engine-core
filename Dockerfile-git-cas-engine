@@ -1,0 +1,17 @@
+FROM python:3.11-slim
+
+# git_cas.py shells out to the real `git` binary (plumbing commands via
+# subprocess) rather than using a Python git library -- python:3.11-slim
+# doesn't ship it.
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# graph_lib.py imports yaml directly; parse_graph.py imports markdown
+# directly (for prologue_html / node body rendering). In a normal
+# mkdocs-based dev environment `markdown` arrives transitively via
+# mkdocs, and pyyaml is a direct pin in requirements.txt -- neither
+# is present in a bare python:3.11-slim image.
+RUN pip install --no-cache-dir pyyaml markdown
+
+WORKDIR /app

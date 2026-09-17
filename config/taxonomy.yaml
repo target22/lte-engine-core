@@ -1,0 +1,137 @@
+# config/taxonomy.yaml
+#
+# DECLARATIVE PARTITION TAXONOMY — extracted verbatim from
+# scripts/graph_lib.py's PARTITIONS list (the prior source of truth).
+#
+# After the Task-1 refactor this file IS the source of truth: graph_lib.py
+# loads it at import time and derives PARTITIONS, PARTITION_LABELS,
+# PARTITION_CODEOWNERS, PARTITION_SCOPE, DOMAIN_TO_PARTITION,
+# PARTITION_TO_DOMAIN, KNOWN_DOMAINS, PUBLIC_PARTITIONS and
+# PRIVATE_PARTITIONS from it. Every other module (parse_graph.py,
+# git_cas.py, validate_markdown.py, compile_from_git.py) already imports
+# those names from graph_lib rather than hardcoding its own copy, so no
+# other Python file needs to change for this extraction.
+#
+# LOAD-BEARING PROPERTIES — do not "tidy" these:
+#
+#   1. LIST ORDER IS SIGNIFICANT. graph.json's "partitions" array is emitted
+#      in this order, and the left navigation pane renders it in array order.
+#      Reordering this file silently reorders the production sidebar.
+#
+#   2. `id` and `domain` ARE TWO INDEPENDENT STRINGS. Never infer one from
+#      the other. Five of the seven differ (spec/core, sop/ops,
+#      adrint/adr-internal, opsint/ops-internal, coreint/core-internal).
+#      Note especially: `coreint` is built from the partition id `core`,
+#      NOT from core's own domain `spec` — it is deliberately not `specint`.
+#
+#   3. `id` doubles as the on-disk directory name: docs/<scope>/<id>/.
+#      partition_dir() in graph_lib.py depends on this identity.
+#
+#   4. `domain` is the anchor prefix: ^<domain>-<...>. It feeds the
+#      domain alternation inside every anchor-matching regex in
+#      config/grammar_rules.json. Adding a partition here widens the
+#      accepted anchor grammar automatically — that is intentional and is
+#      the whole reason the grammar file uses a {domain_alt} placeholder
+#      instead of a frozen literal alternation.
+#
+#   5. `flavor` replaces the hardcoded _KERNEL_FLAVORED_PARTITIONS set.
+#      It selects the Layer 1/2/3 label triple — see config/ui_projection.yaml.
+#
+# SEE 01-AUDIT-FINDINGS.md, FINDING 1 and FINDING 2, before treating the
+# `exec` row or its codeowner as settled.
+
+config_version: "1.0.0"
+
+partitions:
+  - id: core
+    label: "01 · Core Specs & Schemas"
+    domain: spec
+    codeowner: "@core-team"
+    scope: public
+    flavor: kernel
+
+  - id: adr
+    label: "02 · Architecture Decision Records"
+    domain: adr
+    codeowner: "@core-team"
+    scope: public
+    flavor: kernel
+
+  - id: ops
+    label: "07 · SOPs & Operations"
+    domain: sop
+    codeowner: "@ops-lead"
+    scope: public
+    flavor: policy
+
+  # FLAGGED — see 01-AUDIT-FINDINGS.md FINDING 1 (this partition is absent
+  # from the §II architecture table) and FINDING 2 (repo-root CODEOWNERS has
+  # no /docs/private/exec/ rule, so GitHub actually enforces @core-team here
+  # via the `*` catch-all, not @board-exec). The value below mirrors
+  # graph_lib.py as it stands today; it is NOT a claim that CODEOWNERS agrees.
+  - id: exec
+    label: "03i · Executive Board & Strategy"
+    domain: exec
+    codeowner: "@board-exec"
+    scope: private
+    flavor: policy
+
+  - id: adr-internal
+    label: "02i · Internal ADRs & Security Post-Mortems"
+    domain: adrint
+    codeowner: "@core-team"
+    scope: private
+    flavor: kernel
+
+  - id: ops-internal
+    label: "07i · Internal SOPs & Operations"
+    domain: opsint
+    codeowner: "@ops-lead"
+    scope: private
+    flavor: policy
+
+  # Added this revision. FIELD NAMES DIFFER FROM THE BRIEF ON PURPOSE --
+  # see 01-FINDINGS-ROUND9.md FINDING 1. The brief specified
+  # `anchor_domain`/`docs_path`/`owner`/`layer_title` and `flavor: "Kernel"`;
+  # config_loader.load_taxonomy() requires exactly
+  # id/label/domain/codeowner/scope/flavor, rejects an unknown flavor, and
+  # DERIVES the directory from scope+id via partition_dir(). A `docs_path`
+  # key would be a second source of truth for a path already computed.
+  #
+  # `layer_title: META_CONSTITUTION` is NOT recorded here either: layer
+  # labels resolve through flavor -> config/ui_projection.yaml, and putting
+  # one in the taxonomy would make three declaration sites for the same
+  # string. The `meta` flavor below carries it instead, and
+  # load_ui_projection() enforces that every flavor has a complete label
+  # triple, so the axioms partition cannot silently fall through to a
+  # default.
+  #
+  # FLAGGED, same issue as `exec`: CODEOWNERS has no /docs/private/axioms/
+  # rule, so GitHub enforces @core-team via the `*` catch-all, not
+  # @board-exec. This value is a presentation-layer mirror, not enforcement.
+  - id: axioms
+    label: "00 · System Axioms & Meta-Constitution"
+    domain: axiom
+    codeowner: "@board-exec"
+    scope: private
+    flavor: meta
+
+  - id: core-internal
+    label: "01i · Internal Core Specs & Security Architecture"
+    domain: coreint
+    codeowner: "@core-team"
+    scope: private
+    flavor: kernel
+
+# Retired partition ids, kept here as documentation ONLY — the loader
+# ignores this key entirely. Recorded so that an engineer who finds
+# `sales`/`mkt`/`fin` in mongo/schema_nodes.json, mongo/aggregation_facade.js
+# or an older topology document can tell "stale artifact" from "missing row"
+# without re-deriving the history from Git.
+retired:
+  - id: sales
+    removed_because: "Removed from PARTITIONS in an earlier revision; still present in mongo/schema_nodes.json enums."
+  - id: mkt
+    removed_because: "Removed from PARTITIONS in an earlier revision."
+  - id: fin
+    removed_because: "Removed from PARTITIONS in an earlier revision."

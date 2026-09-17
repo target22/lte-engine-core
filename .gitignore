@@ -1,0 +1,58 @@
+# --- Python -----------------------------------------------------------
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- Secrets & credentials ------------------------------------------------
+# Deliberately UNANCHORED (no leading slash) on every line in this
+# section -- these must be caught at ANY depth in the repo, not just
+# the root. A leading slash here would create a blind spot: a
+# subproject's own .env (e.g. logic-trace-engine/.env) would slip
+# through un-ignored if this were anchored to root only.
+.env
+.env.*
+*.pem
+*.key
+secrets/
+
+# --- Build-time compiled artifacts -----------------------------------------
+# NOT "MkDocs build output" (this project doesn't use MkDocs anywhere
+# in its actual pipeline -- that was a stale label carried over from
+# an earlier, unrelated toolchain reference and never corrected).
+# These three already contain an internal '/', which anchors them to
+# the repo root automatically under Git's own matching rules -- the
+# leading '/' below is redundant with that and purely for a human
+# reader's clarity, not a functional requirement.
+# public/data/graph.json
+# public/internal-data/graph-internal.json
+
+# --- Translation cache ---------------------------------------------------
+# Persisted across CI runs via actions/cache, keyed on a hash of
+# docs/**/*.vi.md. Deliberately NOT committed: it changes on every
+# content edit and adds no value in git history, only in the CI cache.
+# Running scripts/translate.py locally will create it on disk; that's
+# expected.
+.translation_cache.json
+
+# --- Editor / OS noise ---------------------------------------------------
+.DS_Store
+.idea/
+
+#.vscode/
+
+# Everything else under .cache/ (not just build_state.json above) --
+# this line makes the explicit /.cache/build_state.json entry above
+# technically redundant (this one alone already covers it), but it's
+# kept for the inline comment explaining specifically WHY that one
+# file is safe to regenerate and never worth committing; remove it if
+# you'd rather have one rule than two overlapping ones.
+.cache/
+
+# vscode-extension
+vscode-extension/node_modules/*
+vscode-extension/.vscode-test
+vscode-extension/out/*
+
+# drafts
+drafts/*

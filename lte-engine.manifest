@@ -1,0 +1,50 @@
+# lte-engine.manifest -- CLI contract binding for THIS engine release.
+#
+# Read by the host wrapper /usr/local/bin/lte (contract 1). The wrapper holds
+# no engine knowledge; everything implementation-specific lives here and is
+# versioned with the engine (git tag -> submodule pin -> this file).
+#
+# Grammar: one directive per line; whitespace-separated tokens; '#' starts a
+# comment; NO quoting, NO shell expansion (tokens cannot contain spaces).
+# Substituted tokens: {repo} {config} {engine} (absolute host paths, identical
+# inside the container via identity mounts) and {image} (runtime image ref).
+contract 1
+
+# ---- runtime image (docker runtime) -----------------------------------------
+# Tag = <image>:rt-<hash of image-inputs>. Code-only releases reuse the image;
+# a dependency or Dockerfile change yields a new tag -> `lte self build`.
+image             lte-cas
+image-dockerfile  Dockerfile-git-cas-engine
+image-inputs      Dockerfile-git-cas-engine requirements.txt
+
+# ---- declarative inputs required under the repo's config dir ----------------
+config  taxonomy.yaml linter_rules.json ui_projection.yaml corpus_layout.yaml
+
+# ---- runtime context -> this engine's variable names -------------------------
+# lte/io/config_reader.py: SRKH_REPO_ROOT wins over the upward walk from the
+# package's own location (which, after decoupling, ends at lib/lte).
+env         SRKH_REPO_ROOT={repo}
+env         SRKH_CONFIG_DIR={config}
+env         PYTHONPATH={engine}
+# 3.11+: drop cwd from sys.path so a stray ./lte/ can never shadow the pin.
+env         PYTHONSAFEPATH=1
+env.docker  LTE_HOOK_IMAGE={image}
+env.native  LTE_HOOK_NO_DOCKER=1
+
+# ---- command surface ---------------------------------------------------------
+# placement: host | container[+net][+cas-rw]
+#   host       runs on the host (pipeline drives docker/ssh/git identity itself)
+#   container  --network none, CAS mounted read-only
+#   +net       network enabled ($LTE_DOCKER_NETWORK, default bridge)
+#   +cas-rw    CAS mounted read-write
+#   name        placement          argv
+cmd compile     container          python -m lte.cli.compile
+cmd ingest      container+cas-rw   python -m lte.cli.ingest
+cmd lint        container          python -m lte.cli.lint
+cmd ask         container+net      python -m lte.cli.ask
+cmd pipeline    host               python3.11 -m lte.cli.pipeline
+cmd pre-commit  host               python3.11 -m lte.cli.hooks.pre_commit
+
+# ---- health probes (`lte self doctor`) ---------------------------------------
+probe host       python3.11 -c assert(__import__('sys').version_info>=(3,5));__import__('yaml')
+probe container  python -c assert(__import__('sys').version_info>=(3,11));__import__('yaml');__import__('markdown')

@@ -1,0 +1,276 @@
+# config/build_config.yaml
+#
+# DECLARATIVE PIPELINE DEFINITION — replaces scripts/sync_and_compile.sh.
+# Executed by lte/cli/pipeline.py (formerly scripts/core_pipeline/task_runner.py),
+# which knows nothing about Docker, Git, or this project: it reads steps,
+# merges environments, runs command strings, and enforces halt_on_error.
+# All domain knowledge lives here.
+#
+# MIGRATION STEP 6 — the container steps call the lte package entry points:
+#   batch_sync.py        -> python -m lte.cli.ingest --batch --no-lint
+#   compile_from_git.py  -> python -m lte.cli.compile --source cas
+#   (parse_graph.py      -> python -m lte.cli.compile --source disk; not
+#    invoked by this pipeline, which compiles from the CAS repo.)
+# preflight.py stays on the legacy script until it is ported. Rollback is
+# reverting this one commit; scripts/core_pipeline/ still works until step 7.
+# `python -m` needs the repo root on sys.path, which `-w /app` provides.
+#
+# Pipeline, unchanged from the Bash original:
+#   pre-flight -> image build -> batch ingest docs/ into the CAS repo ->
+#   compile public + internal graphs in memory -> push Tier 1 (origin) ->
+#   push Tier 3 (cas-remote) -> dashboard.
+#
+# RUN IT ON THE HOST, NOT IN THE CONTAINER:
+#   cd /home/SRKH && python3 -m lte.cli.pipeline --config config/build_config.yaml
+# This file orchestrates containers — build-image runs `docker build`, and
+# three steps run `docker run`. Inside an ephemeral --rm container there is
+# no docker daemon, no git identity for batch-ingest, and no SSH agent for
+# either push. (--list and --dry-run appear to work in the container only
+# because neither executes anything.)
+#
+# ---------------------------------------------------------------------
+# WHY THERE IS NO `DOCKER_RUN` VARIABLE AND NO `eval`
+# ---------------------------------------------------------------------
+# An earlier revision of this file factored the container invocation into
+#   DOCKER_RUN: 'docker run --rm -v "$PWD":/app ... "$DOCKER_IMAGE"'
+# and each step ran `eval "$DOCKER_RUN" python scripts/...`.
+#
+# That was wrong, and it failed in production on a two-word author name.
+# `eval` re-parses the command AFTER the shell has already expanded and
+# de-quoted it, so quoting applied in the outer command is gone by the time
+# eval runs:
+#
+#   --author-name "${GIT_AUTHOR_NAME:-$(git config user.name)}"
+#     pass 1 -> --author-name Alan N.        (quotes consumed)
+#     pass 2 -> argv: [--author-name] [Alan] [N.]
+#     result -> batch_sync.py: error: unrecognized arguments: N.
+#     (lte.cli.ingest would fail the same way if eval came back)
+#
+# Note the asymmetry that makes this hard to spot: values quoted INSIDE the
+# DOCKER_RUN string (its own escaped "$CAS_REPO") survive the second parse,
+# because their quotes are still literal text at that point. Values quoted
+# in the step's own command do not. So the volume mounts looked correct
+# while the author name silently split in two.
+#
+# The `docker run` prefix is therefore written out in each of the three
+# container steps. That repeats one line three times, and in exchange the
+# command that runs is exactly the command written here — one parse pass,
+# no second interpretation layer, and `--dry-run` shows the real thing.
+# Paths and names containing spaces survive correctly. Same lesson as the
+# earlier execFile/argv fix in the VS Code extension: build the argument
+# vector, do not re-interpret a string.
+#
+# ---------------------------------------------------------------------
+# WHAT THE BASH SCRIPT DID THAT A STEP LIST CANNOT
+# ---------------------------------------------------------------------
+#   1. NO STATE FLOWS BETWEEN STEPS. Each step is its own subprocess, so
+#      $AUTHOR_NAME, $ORIGIN_URL and $SYNC_SUMMARY_LINE cannot be computed
+#      once and reused. Steps re-derive what they need inline, or read a
+#      declared file artifact (SYNC_LOG). The filesystem is the only
+#      channel; the runner itself stays stateless by design.
+#
+#   2. CONDITIONAL LOGIC NOW LIVES IN PYTHON. The original's ~35 lines of
+#      pre-flight branching were briefly four YAML block scalars here,
+#      which was the weakest part of the translation: no syntax checking,
+#      no linting, no test seam. They are now scripts/core_pipeline/preflight.py, a
+#      single step below. The remaining conditionals in this file are
+#      tier1-commit's emptiness guard (three lines) and the dashboard
+#      heredoc.
+#
+#   3. A BARE `git commit` FAILS WHEN THERE IS NOTHING TO COMMIT, so
+#      halt_on_error would abort on every run where docs/ is unchanged.
+#      The emptiness guard in tier1-commit is load-bearing.
+#
+#   4. THE DASHBOARD IS DEGRADED. It reads SYNC_LOG and the two compiled
+#      artifacts rather than captured stdout; per-step timings come from
+#      the runner's own summary table.
+
+config_version: "1.0.0"
+
+# Resolved relative to this file's parent's parent, matching the Bash
+# original's `cd "$(dirname "$0")/.."`. Every step runs from the repo root
+# regardless of the caller's cwd.
+working_directory: "."
+
+# Each command runs in a fresh shell, so `set -e` in one step does not
+# carry to the next. The prelude is injected into every command string to
+# preserve the original's `set -euo pipefail` semantics — pipefail
+# specifically matters for the `| tee` in batch-ingest, where without it a
+# failing lte.cli.ingest would be masked by a succeeding tee.
+shell_executable: "/bin/bash"
+shell_prelude: "set -euo pipefail"
+
+# Merged over the parent process environment, which is inherited — PATH,
+# HOME, SSH_AUTH_SOCK and the git credential helpers all survive, and the
+# Tier 1 and Tier 3 pushes depend on that. Values may reference each other
+# and the parent env via ${VAR}; the runner expands them to a fixed point,
+# so declaration order does not matter.
+environment:
+  CAS_REPO: "/var/lib/lte/knowledge.git"
+  CAS_BRANCH: "main"
+  CAS_REMOTE_NAME: "cas-remote"
+  # As given in the original script. Still worth a second look before
+  # relying on it: contract-node_schema.json's own $id spells the project
+  # "logic-trace-ENGINE"; this URL says "logic-trace-EGINE" (no 'n').
+  # Carried over verbatim rather than silently "corrected" — a wrong guess
+  # here is worse than a flagged one.
+  CAS_REMOTE_URL: "git@github.com:target22/logic-trace-egine-git-internal.git"
+  DOCKER_IMAGE: "lte-cas"
+  PUBLIC_GRAPH_OUT: "public/data/graph.json"
+  INTERNAL_GRAPH_OUT: "public/internal-data/graph-internal.json"
+  # A declared artifact path, not a temp file: it is the channel by which
+  # batch-ingest's summary reaches the dashboard step. See note 1 above.
+  SYNC_LOG: "/tmp/lte-batch-sync.log"
+
+steps:
+
+  # ----------------------------------------------------------------- 1/9
+  - name: "preflight"
+    description: >-
+      Replaces the four shell-conditional steps this file used to carry.
+      The branching now lives in scripts/core_pipeline/preflight.py, where it gets syntax
+      checking, a test seam, and real argv construction instead of being a
+      multi-branch conditional inside a YAML block scalar.
+    halt_on_error: true
+    # preflight.py exits 2 for "warnings only" -- today that means a CAS
+    # remote pointing somewhere other than $CAS_REMOTE_URL, which the Bash
+    # original warned about and continued past. Without this key the runner
+    # would abort on it, because halt_on_error is a boolean and knows
+    # nothing about which non-zero codes are benign. Exit 1 still aborts.
+    allow_exit_codes: [0, 2]
+    command: |
+      python3 scripts/core_pipeline/preflight.py \
+        --repo "$CAS_REPO" --branch "$CAS_BRANCH" \
+        --remote-name "$CAS_REMOTE_NAME" --remote-url "$CAS_REMOTE_URL"
+
+  # ----------------------------------------------------------------- 2/9
+  - name: "build-image"
+    description: >-
+      The only real cache in this pipeline. A fast run means Docker's layer
+      cache was used; there is no separate incremental COMPILE cache.
+    halt_on_error: true
+    # Streamed rather than captured: a cold build takes minutes and silent
+    # capture is indistinguishable from a hang.
+    stream: true
+    timeout: 1800
+    command: docker build -t "$DOCKER_IMAGE" -f Dockerfile-git-cas-engine .
+
+  # ----------------------------------------------------------------- 3/9
+  - name: "batch-ingest"
+    description: >-
+      docs/ -> CAS repo. docs/ is only ever READ; lte.cli.ingest never
+      writes to it. On failure nothing is committed and docs/ is untouched.
+      Append-only: files deleted from docs/ stay in the CAS. Author identity
+      is re-derived inline because no state survives from
+      preflight-identity.
+    halt_on_error: true
+    stream: true
+    # The author name legitimately contains a space ("Alan N."). It stays a
+    # single argv element only because there is exactly one parse pass here
+    # — see the eval note at the top of this file.
+    #
+    # --no-lint keeps parity with batch_sync.py: changed files are still
+    # validated against the CAS corpus (fence parity, duplicate, orphan,
+    # misplaced and cross-boundary anchors), but the additional working-tree
+    # lint (lte.validators.corpus) that batch_sync.py never ran is skipped.
+    # The ingest summary line is `[ingest] SUMMARY_JSON:`; the dashboard
+    # accepts it and the legacy `[batch-sync]` prefix.
+    command: |
+      docker run --rm -v "$PWD":/app -v "$CAS_REPO":"$CAS_REPO" -w /app "$DOCKER_IMAGE" \
+        python -m lte.cli.ingest --batch --no-lint \
+        --repo "$CAS_REPO" --branch "$CAS_BRANCH" \
+        --author-name "${GIT_AUTHOR_NAME:-$(git config user.name)}" \
+        --author-email "${GIT_AUTHOR_EMAIL:-$(git config user.email)}" \
+        | tee "$SYNC_LOG"
+
+  # ----------------------------------------------------------------- 4/9
+  - name: "compile-public"
+    description: "docs/public/ only, 3 partitions. Never reads docs/private/."
+    halt_on_error: true
+    command: |
+      docker run --rm -v "$PWD":/app -v "$CAS_REPO":"$CAS_REPO" -w /app "$DOCKER_IMAGE" \
+        python -m lte.cli.compile --source cas \
+        --repo "$CAS_REPO" --branch "$CAS_BRANCH" \
+        --scope public --output "$PUBLIC_GRAPH_OUT"
+
+  # ----------------------------------------------------------------- 5/9
+  - name: "compile-internal"
+    description: >-
+      docs/public/ + docs/private/, all private partitions included. Serve the output only
+      behind nginx's auth_basic-gated /internal-data/ route.
+    halt_on_error: true
+    command: |
+      docker run --rm -v "$PWD":/app -v "$CAS_REPO":"$CAS_REPO" -w /app "$DOCKER_IMAGE" \
+        python -m lte.cli.compile --source cas \
+        --repo "$CAS_REPO" --branch "$CAS_BRANCH" \
+        --scope internal --output "$INTERNAL_GRAPH_OUT"
+
+  # ----------------------------------------------------------------- 6/9
+  - name: "tier1-commit"
+    description: >-
+      Scoped to docs/ specifically, NOT `git add -A`: a blanket add in a
+      sync script risks sweeping up unrelated in-progress work elsewhere in
+      the tree. graph.json outputs are deliberately NOT force-added —
+      .gitignore excludes both on purpose. The emptiness guard is
+      load-bearing: without it, `git commit` exits non-zero on every run
+      where docs/ is unchanged and halt_on_error aborts the pipeline.
+    halt_on_error: true
+    command: |
+      if [ -n "$(git status --porcelain -- docs/)" ]; then
+        git add docs/
+        git commit -m "sync: docs/ update via task_runner ($(date -u +%FT%TZ))"
+        echo "Committed docs/ changes."
+      else
+        echo "No docs/ changes to commit."
+      fi
+
+  # ---------------------------------------------------------------- 7/9
+  - name: "tier1-push"
+    description: >-
+      Runs natively on the host, not in a container: git push needs the
+      host's SSH agent and credential helpers, which an ephemeral --rm
+      container does not have unless explicitly mounted in.
+    halt_on_error: true
+    stream: true
+    command: git push origin HEAD
+
+  # ---------------------------------------------------------------- 8/9
+  - name: "tier3-push"
+    description: "Backup Tier 3 -- the CAS binary engine. Also native, same reason."
+    halt_on_error: true
+    stream: true
+    command: git --git-dir="$CAS_REPO" push "$CAS_REMOTE_NAME" "$CAS_BRANCH"
+
+  # --------------------------------------------------------------- report
+  - name: "dashboard"
+    description: >-
+      Reconstructed summary. halt_on_error is false: a reporting step must
+      never be what fails a pipeline whose real work already succeeded.
+      Reads SYNC_LOG rather than captured stdout, since no state flows
+      between steps. Runs on the HOST interpreter, so it uses %-formatting
+      rather than f-strings — verified against Python 3.5.
+    halt_on_error: false
+    stream: true
+    command: |
+      python3 - <<'PY'
+      import json, os, re, pathlib
+      def nodes(p):
+          try:
+              m = json.loads(pathlib.Path(p).read_text())["metadata"]
+              return "%s nodes (schema %s)" % (m["total_nodes"], m.get("schema_version", "UNVERSIONED"))
+          except Exception as e:
+              return "unreadable (%s)" % e.__class__.__name__
+      log = pathlib.Path(os.environ["SYNC_LOG"])
+      summary = "unavailable"
+      if log.is_file():
+          hit = re.search(r"^\[(?:ingest|batch-sync)\] SUMMARY_JSON:(.*)$", log.read_text(), re.M)
+          if hit:
+              d = json.loads(hit.group(1))
+              summary = "%s added, %s updated, %s unchanged, %s skipped" % (
+                  d["added"], d["updated"], d["unchanged"], d["skipped"])
+      print("=" * 76)
+      print(" Ingestion : %s" % summary)
+      print(" Public    : %s" % nodes(os.environ["PUBLIC_GRAPH_OUT"]))
+      print(" Internal  : %s" % nodes(os.environ["INTERNAL_GRAPH_OUT"]))
+      print("=" * 76)
+      PY

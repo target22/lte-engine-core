@@ -1,0 +1,28 @@
+# Deployment A -- Corporate Governance OS.
+#
+#   governance-os/
+#   ├── left-pane/     Immutable Policy Plane   (policies, SOPs)
+#   └── right-pane/    Context & Operations Plane (debates, execution logs)
+#
+# One scope; the two panes are partitions. right-pane pairs with left-pane,
+# so right-pane/hr/leave.en.md joins the document left-pane/hr/leave.en.md
+# instead of compiling as a separate, contract-less document. Its files need
+# no role segment: they default to `debate`.
+layout_version: "1.0.0"
+root: "governance-os"
+scopes:
+  - {id: corporate, path: ".", level: 0}
+partitions:
+  policy:
+    path: left-pane
+  operations:
+    path: right-pane
+    default_role: debate
+    pairs_with: policy
+filenames:
+  locale: {mode: suffix, values: [en, vi]}
+  extensions: [".md"]
+ignore: ["**/README*"]
+staging: {root: drafts}
+targets:
+  - {id: public, scopes: [corporate], artifact: public/data/graph.json, exposure: public}

@@ -1,0 +1,363 @@
+{
+  "config_version": "1.0.0",
+  "_comment_identity": [
+    "config/linter_rules.json — the externalized AST grammar for the linter",
+    "(validate_markdown.py) and the parser (parse_graph.py / git_cas.py), both of",
+    "which reach it through graph_lib.py.",
+    "",
+    "THIS FILE SUPERSEDES config/grammar_rules.json FROM THE PREVIOUS PHASE. Same",
+    "contract, same content, renamed to the identifier this phase specifies. The two",
+    "MUST NOT coexist: two files declaring the anchor grammar is precisely the",
+    "dual-source condition this refactor exists to eliminate, and the loader reads",
+    "only one of them, so the other would sit in the tree looking authoritative while",
+    "changing nothing. Delete config/grammar_rules.json and repoint",
+    "config_loader.GRAMMAR_PATH. See 01-AUDIT-FINDINGS-PHASE2.md FINDING 1."
+  ],
+  "_comment_purpose": [
+    "Patterns are TEMPLATES, not finished regexes: the loader substitutes the",
+    "placeholders below before compiling. This is deliberate — the anchor-matching",
+    "patterns depend on the live domain list in config/taxonomy.yaml, and freezing a",
+    "literal domain alternation into this file would create a second source of truth",
+    "for the taxonomy that silently desyncs the moment a partition is added."
+  ],
+  "_comment_substitution": [
+    "SUBSTITUTION IS .replace(), NEVER str.format(). Three patterns contain literal",
+    "regex braces — heading's {1,6}, admonition_indent's {4}, and admonition_status's",
+    "literal '{status:' / '\\\\}' — which str.format() would either raise on or silently",
+    "mangle. The loader performs exact token replacement of every placeholder listed",
+    "under `placeholders`, then rejects ANY surviving brace-wrapped identifier: an",
+    "unknown token such as {node_id} is a valid regex (Python treats a non-quantifier",
+    "brace group as literal text), so it would compile cleanly and then match nothing,",
+    "reporting the resulting empty corpus as a legitimate one."
+  ],
+  "placeholders": {
+    "domain_alt": "Alternation of every re.escape()d `domain` in config/taxonomy.yaml, sorted longest-first.",
+    "anchor_id": "anchor_id_template below, with {domain_alt} already substituted.",
+    "role_alt": "Alternation of every re.escape()d entry in document_roles below.",
+    "file_role_alt": "Alternation of every re.escape()d entry in file_naming.roles below.",
+    "locale_alt": "Alternation of config/corpus_layout.yaml filenames.locale.values (mode: suffix), or the empty string (mode: none).",
+    "locale_sep": "'\\.' when config/corpus_layout.yaml filenames.locale.mode is 'suffix', else the empty string. Always written immediately before the locale group, so mode 'none' compiles to an empty locale group.",
+    "extension_pattern": "config/corpus_layout.yaml filenames.extensions: '\\.md' for a single extension, '(?:\\.md|\\.markdown)' for several."
+  },
+  "_comment_placeholders_layout": [
+    "locale_alt, locale_sep and extension_pattern come from config/corpus_layout.yaml,",
+    "not from this file. The locale set and the file extension are corpus-layout facts;",
+    "declaring them here as well would be a second source of truth for the same set.",
+    "With the default layout (suffix mode, vi/en, .md) split_document expands to",
+    "exactly the pattern this file carried before those placeholders existed."
+  ],
+  "domain_alternation_sort": "length_desc",
+  "anchor_id_template": "(?:{domain_alt})(?:-[A-Za-z0-9]+)+",
+  "_comment_anchor_id": [
+    "Generalized across BOTH grammars on purpose: a known domain followed by one or",
+    "more further hyphen-separated alphanumeric segments. Accepts the flat 2-segment",
+    "style (spec-001) and the deep tractate/chapter/node style (spec-fp-01-001) with",
+    "one pattern, because both are just 'domain, then >=1 more segments'."
+  ],
+  "document_roles": [
+    "contract",
+    "debate",
+    "ops"
+  ],
+  "status_values": [
+    "draft",
+    "pending",
+    "active",
+    "deprecated",
+    "archived"
+  ],
+  "_comment_status_values": [
+    "The closed status lexicon (graph_lib.py's STATUS_VALUES). public/app.js carries",
+    "its own STATUS_BADGE_CLASS map over these same five values plus the",
+    "compiler-generated 'ast_non_compliant'. That frontend map is a separate,",
+    "unsynchronized copy and is NOT loaded from this file — a zero-build static SPA",
+    "cannot import a Python-side config. Adding a sixth value here renders as",
+    "badge-ghost via app.js's `||` fallback, silently."
+  ],
+  "patterns": {
+    "spec_anchor": "^\\^(?P<id>{anchor_id})\\s*$",
+    "heading": "^(#{1,6})\\s+(.*\\S)\\s*$",
+    "ref_callout_start": "^>\\s*\\[!(?P<kind>ref|ops)-(?P<id>{anchor_id})\\]\\s*(?P<title>.*)$",
+    "blockquote_line": "^>\\s?(.*)$",
+    "admonition_open": "^(?P<marker>!!!|\\?\\?\\?\\+)\\s+(?P<type>note|warning|tip)\\s+\"(?P<title>[^\"]*)\"\\s*$",
+    "admonition_indent": "^ {4}(?P<rest>.*)$",
+    "admonition_blank": "^\\s*$",
+    "admonition_trailing_anchor": "^(?P<pre>.*?)\\s*\\^(?P<id>{anchor_id})\\s*$",
+    "admonition_ref_line": "^>\\s*\\[!ref-(?P<id>{anchor_id})\\]\\s*(?P<title>.*)$",
+    "admonition_status": "^\\{status:\\s*(?P<status>[A-Za-z][A-Za-z0-9_-]*)\\s*\\}$",
+    "split_document": "^(?P<slug>.+)\\.(?P<role>{role_alt}){locale_sep}(?P<lang>{locale_alt}){extension_pattern}$",
+    "document_h1": "^#\\s+(.*\\S)\\s*$",
+    "frontmatter_fence": "^---\\s*$"
+  },
+  "_comment_grammar_split": [
+    "GRAMMAR 1 (legacy heading style): heading + spec_anchor + ref_callout_start +",
+    "blockquote_line. A Markdown heading of any level, arbitrary content, terminated",
+    "by a line containing only ^<domain>-<id>. Its callouts carry the kind in the",
+    "token itself — [!ref-...] vs [!ops-...] — captured by ref_callout_start's",
+    "(?P<kind>ref|ops) group.",
+    "",
+    "GRAMMAR 2 (MkDocs-Material admonitions): the admonition_* patterns. Deeper",
+    "hierarchical anchor ids, 4-space-indented bodies. Exactly ONE link token,",
+    "[!ref-...], for both warning and tip blocks; whether the result is a debate or a",
+    "checklist is decided by the enclosing admonition type, not the token text — see",
+    "config/ui_projection.yaml's admonitions.<type>.callout_kind.",
+    "",
+    "Both grammars are live simultaneously and produce identical SpecNode/RefCallout",
+    "objects. parse_file() dispatches per-block on whichever opener it sees, in one",
+    "pass over the file."
+  ],
+  "required_named_groups": {
+    "spec_anchor": [
+      "id"
+    ],
+    "ref_callout_start": [
+      "kind",
+      "id",
+      "title"
+    ],
+    "admonition_open": [
+      "marker",
+      "type",
+      "title"
+    ],
+    "admonition_indent": [
+      "rest"
+    ],
+    "admonition_trailing_anchor": [
+      "pre",
+      "id"
+    ],
+    "admonition_ref_line": [
+      "id",
+      "title"
+    ],
+    "admonition_status": [
+      "status"
+    ],
+    "split_document": [
+      "slug",
+      "role",
+      "lang"
+    ]
+  },
+  "required_group_counts": {
+    "heading": 2,
+    "blockquote_line": 1,
+    "document_h1": 1,
+    "admonition_blank": 0,
+    "frontmatter_fence": 0
+  },
+  "_comment_required_groups": [
+    "Fail-fast contract. Every call site reaches into these patterns by group NAME or",
+    "positional index. Without these assertions a dropped '?P<id>' would compile",
+    "cleanly and parse the whole corpus to zero nodes — which the pipeline would then",
+    "report as an empty-but-valid document set, not as a broken grammar."
+  ],
+  "diagnostic_patterns": {
+    "_comment": [
+      "QUARANTINED SECTION — DO NOT UNIFY THESE WITH `patterns` ABOVE.",
+      "",
+      "ingest.py's check_likely_typos() uses these two DELIBERATELY PERMISSIVE",
+      "patterns to emit WARN-only nudges: they match a line that looks like it is",
+      "TRYING to be an anchor or a ref callout but does not match the real grammar —",
+      "most often a typo'd domain such as ^specint-001. The author then finds out at",
+      "ingest time instead of discovering months later that a block was silently",
+      "unindexed.",
+      "",
+      "Their looseness is the entire point. They accept [A-Za-z0-9-]+ where the real",
+      "grammar accepts only a KNOWN domain. 'Tightening' them to the strict patterns",
+      "would make them match only VALID anchors, so check_likely_typos() would warn",
+      "about nothing and the diagnostic would be silently lost — no error, no test",
+      "failure, just a check that stopped checking.",
+      "",
+      "They take no placeholders and are compiled as literals.",
+      "",
+      "Explicitly NOT extracted into this file: parse_graph.py's _TAG_RE,",
+      "_WHITESPACE_RE and _SPACE_BEFORE_PUNCT_RE. Those are HTML-stripping and",
+      "whitespace-normalizing helpers inside plain_text_summary() — rendering",
+      "internals, not AST grammar. Externalizing them would put presentation-layer",
+      "mechanics into a file the linter treats as the domain contract. Likewise the",
+      "repair-tool patterns in fix_markdown.py / fix_domain_typo.py and the tag",
+      "patterns in extract_public.py: those tools are deliberately loose in their own",
+      "distinct ways and are not part of the parse contract.",
+      "",
+      "validate_markdown.py defines no regexes of its own — it derives everything",
+      "from graph_lib.py. Confirmed by grep; nothing to extract there."
+    ],
+    "loose_anchor_line": "^\\s*\\^([A-Za-z0-9-]+)\\s*$",
+    "loose_ref_line": "^\\s*>\\s*\\[!([A-Za-z0-9-]+)\\]"
+  },
+  "diagnostic_required_group_counts": {
+    "loose_anchor_line": 1,
+    "loose_ref_line": 1
+  },
+  "file_naming": {
+    "_comment": [
+      "DECLARATIVE FILE-NAMING VALIDATION (Task 1).",
+      "",
+      "THE ROLE SEGMENT IS OPTIONAL, AND THAT IS NOT NEGOTIABLE WITH THE CORPUS.",
+      "The brief specified ^.+\\.(contract|debate|ops|evi)\\.[a-z]{2}\\.md$, which",
+      "makes the role MANDATORY. Tested against the live corpus, that pattern",
+      "rejects 100% of real filenames -- 01-architecture-overview.en.md,",
+      "000-template.vi.md and every other file predate the split-file",
+      "convention and legitimately carry no role. graph_lib.document_role_of()",
+      "documents this explicitly: a None role 'is never missing a role, it",
+      "simply predates the convention'. Enforcing the brief's pattern verbatim",
+      "would emit 56 warnings on a clean build.",
+      "",
+      "LOCALES AND EXTENSIONS ARE NOT DECLARED HERE. They come from",
+      "config/corpus_layout.yaml (filenames.locale, filenames.extensions) through the",
+      "{locale_sep}, {locale_alt} and {extension_pattern} placeholders, the same values",
+      "file discovery uses. A naming rule wider than discovery would PASS a file the",
+      "compiler never sees -- a silently dropped document; one source removes that gap.",
+      "A 'locales' key here is rejected at load time as a duplicate declaration.",
+      "",
+      "THE ROLE SEGMENT FOLLOWS THE SLUG: (?:\\.(?P<role>...))? before the locale segment.",
+      "It accepts the same names as the earlier \\.(?:(?P<role>...)\\.)?(?P<locale>...) form",
+      "and also compiles when the layout declares no locale segment at all.",
+      "",
+      "`roles` HERE IS DELIBERATELY NOT `document_roles` ABOVE. document_roles",
+      "drives SPLIT_DOCUMENT_RE, which MERGES sibling files into one logical",
+      "document. Adding 'evi' there would make incident-2026-05.evi.en.md a",
+      "sibling of incident-2026-05.en.md and fold its content into that",
+      "document's node set -- the opposite of Task 3's intent that evidence",
+      "stands alone as unindexed prose. This list is for naming validation only.",
+      "SLUG EXCLUDES DOTS ([^.]+, not .+?). With a lazy .+? slug, a MISTYPED role segment silently reabsorbs into the slug -- '01-x.contarct.en.md' matches cleanly as slug='01-x.contarct' and nothing is reported, which makes the whole role whitelist unenforceable. No filename in the live corpus contains a dot in its stem, so excluding dots costs nothing and turns a typo'd role into a diagnostic."
+    ],
+    "roles": [
+      "contract",
+      "debate",
+      "ops",
+      "evi"
+    ],
+    "evidence_role": "evi",
+    "pattern": "^(?P<slug>[^.]+)(?:\\.(?P<role>{file_role_alt}))?{locale_sep}(?P<locale>{locale_alt}){extension_pattern}$",
+    "required_named_groups": [
+      "slug",
+      "role",
+      "locale"
+    ],
+    "severity": "warn",
+    "diagnostic_source": "file-naming-convention"
+  },
+  "payload_lock": {
+    "_comment": [
+      "REF-GATED PAYLOAD LOCK POLICY (Task 2). Declarative boundaries for the",
+      "pre-commit hook. NOTHING ENFORCES THESE YET -- see FINDING 4. The",
+      "compiler is a pure read-model builder and never writes to docs/; a lock",
+      "is a WRITE-path concern and therefore belongs in a Git hook, which does",
+      "not exist in this repo today.",
+      "",
+      "The state machine the hook implements, per anchor:",
+      "  unreferenced -> body mutable, frontmatter mutable",
+      "  referenced   -> body IMMUTABLE, only mutable_frontmatter_keys may change",
+      "A node becomes referenced the moment any [!ref-<anchor>] resolves to it,",
+      "which graph_lib.find_orphan_refs() already computes as a side effect."
+    ],
+    "mutable_frontmatter_keys": [
+      "status",
+      "tags",
+      "supersedes",
+      "superseded_by"
+    ],
+    "locked_unit": "node_body",
+    "lock_trigger": "inbound_ref",
+    "unreferenced_documents_mutable": true,
+    "ast_non_compliant_mutable": true,
+    "enforcement_point": "git_pre_commit_hook",
+    "enforced": true
+  },
+  "dependent_lifecycle": {
+    "_comment": [
+      "INDEPENDENT DEPENDENT-NODE LIFECYCLE (Task 3). Everything the dependent",
+      "state machine needs, declared rather than hardcoded. graph_lib.py loads",
+      "this via config_loader.load_dependent_lifecycle() at import time.",
+      "",
+      "WHY NO `status_values` KEY HERE: the dependent lexicon is THE SAME closed",
+      "set as `status_values` above, not a second copy of it. A duplicate list",
+      "would be a second source of truth for one closed set -- exactly the",
+      "failure mode this config extraction exists to remove. `strictness_order`",
+      "below is validated to be a PERMUTATION of `status_values`, so adding a",
+      "sixth status up there without ranking it down here raises at import",
+      "instead of silently producing an unrankable value at compile time.",
+      "",
+      "`anchor_reference_fields` IS A NAMESPACE DECISION, NOT A DETAIL. At",
+      "DOCUMENT level (Tier 3) `superseded_by` carries a document_id -- see",
+      "graph_lib.document_metadata_from_text(). On a DEPENDENT-ROLE file it",
+      "carries an ANCHOR id (Tier 4), because what a deprecated dependent needs",
+      "to point at is the rule that replaced its parent, not a document. Those",
+      "are two different namespaces sharing one key name, distinguished only by",
+      "the file's role segment. That is a real smell, and it is declared here",
+      "rather than hardcoded precisely so the alternative -- a distinct",
+      "`superseded_by_anchor` key -- is a one-line config edit and not a code",
+      "change. If you take that option, add the field to this list and to",
+      "conditional_requirements.deprecated together."
+    ],
+    "dependent_roles": [
+      "debate",
+      "ops",
+      "evi"
+    ],
+    "archived_reasons": [
+      "orphaned_dependency",
+      "obsolete_logic",
+      "superseded_contract",
+      "merged_into_sibling",
+      "duplicate_coverage"
+    ],
+    "conditional_requirements": {
+      "archived": [
+        "archived_reason"
+      ],
+      "deprecated": [
+        "archived_reason",
+        "superseded_by"
+      ]
+    },
+    "enum_fields": {
+      "archived_reason": "archived_reasons"
+    },
+    "anchor_reference_fields": [
+      "superseded_by"
+    ],
+    "strictness_order": [
+      "active",
+      "pending",
+      "draft",
+      "deprecated",
+      "archived"
+    ],
+    "invalidating_parent_states": [
+      "deprecated",
+      "archived"
+    ],
+    "invalidated_state": "invalidated",
+    "severity": "fail",
+    "diagnostic_source": "dependent-lifecycle"
+  },
+  "unindexed_policy": {
+    "_comment": [
+      "UNINDEXED PROSE TOLERANCE (Task 3). A file with zero parsed contract",
+      "nodes already compiles as ast_valid=false / status='ast_non_compliant'",
+      "with a non-fatal [WARN] -- that behavior predates this config and is",
+      "verified, not newly built. This section makes the SEVERITY configurable",
+      "per partition rather than fixed at 'warn' in Python.",
+      "",
+      "'fail' is honoured by validate_markdown.py's strict mode only. The",
+      "compilers stay non-fatal regardless: a compiler that refuses to emit a",
+      "graph because one document is unanchored would take down the whole",
+      "corpus for one incident log."
+    ],
+    "default": "warn",
+    "by_partition": {
+      "axioms": "info",
+      "ops-internal": "info",
+      "core-internal": "warn"
+    },
+    "levels": [
+      "info",
+      "warn",
+      "fail"
+    ]
+  }
+}

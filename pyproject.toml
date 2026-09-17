@@ -1,0 +1,60 @@
+# lte-engine-core/pyproject.toml -- Phase 2 (native) packaging.
+#
+#   python3.11 -m venv .venv && .venv/bin/pip install -e lib/lte
+#   LTE_RUNTIME=native  ->  `lte <cmd>` runs on the host, no Docker.
+#
+# VERSIONING   git tag vX.Y.Z-LTS  <->  version = "X.Y.Z"
+#   PEP 440 has no "-LTS" segment (1.0.0-LTS is InvalidVersion), so the
+#   channel lives in the tag only. Static on purpose: lte.__version__ is not
+#   read (it holds a non-PEP-440 string) and setuptools-scm cannot parse the tag.
+#
+# INTERPRETER  >=3.11 = the only verified engine runtime (lte-cas image).
+#   The engine layers use `from __future__ import annotations` + dataclasses
+#   (>=3.7 syntax); host python3.11 3.6.8 can neither build this file
+#   (setuptools>=61 needs >=3.7) nor editable-install it (PEP 660 needs
+#   setuptools>=64). lte.runner / lte.cli.pipeline / lte.cli.hooks keep their
+#   3.5 floor and still run on the host through the manifest's `python3.11 -m`.
+#
+# DEPENDENCIES  core runtime imports only (yaml, markdown). No tooling deps,
+#   no extras: translate/watch deps belong to lte-dev (boundary rule B4).
+#   Keep requirements.txt (image recipe) naming exactly these distributions.
+#
+# ENTRY POINTS  lte-<cmd> mirrors the manifest's `cmd` names. They call
+#   main() directly and bypass each module's `if __name__ == "__main__"`
+#   block; `lte <cmd>` (python -m) is the canonical invocation.
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lte-engine-core"
+version = "1.0.0"
+description = "LT ENGINE core: config-driven bilingual Markdown-to-graph knowledge compiler."
+requires-python = ">=3.11"
+dependencies = [
+    "PyYAML>=6.0",
+    "Markdown>=3.4",
+]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+lte-compile    = "lte.cli.compile:main"
+lte-ingest     = "lte.cli.ingest:main"
+lte-lint       = "lte.cli.lint:main"
+lte-ask        = "lte.cli.ask:main"
+lte-pipeline   = "lte.cli.pipeline:main"
+lte-pre-commit = "lte.cli.hooks.pre_commit:main"
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lte", "lte.*"]
+namespaces = false

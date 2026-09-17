@@ -1,0 +1,32 @@
+# Deployment B -- Personal Knowledge OS.
+#
+#   personal-os/
+#   ├── 00_Inbox-Raw        raw capture: ignored, never compiled or ingested
+#   ├── 01_Philosophy       core values, ethics, worldview
+#   ├── 02_Infrastructure   tech stack, continuity, operations
+#   ├── 03_Evidence         archives, case studies, audit logs  (restricted)
+#   └── 04_Releases         snapshots, centennial vision
+#
+# Visibility is per folder, not per parent directory, so both scopes are
+# directory-less (path: null) and each partition names its own folder.
+# Single language, no locale suffix: values.md, not values.en.md.
+layout_version: "1.0.0"
+root: "personal-os"
+scopes:
+  - {id: open,  path: null, level: 0}
+  - {id: vault, path: null, level: 10}
+partitions:
+  philosophy:     {path: 01_Philosophy}
+  infrastructure: {path: 02_Infrastructure}
+  evidence:       {path: 03_Evidence}
+  releases:       {path: 04_Releases}
+filenames:
+  locale: {mode: none, default: en}
+  extensions: [".md", ".markdown"]
+# Inbox capture, READMEs, hidden tool folders (.obsidian/), and loose notes
+# at the root (`*.md` matches only root-level files).
+ignore: ["00_Inbox-Raw/**", "**/README*", "**/.*", "**/.*/**", "*.md"]
+staging: {root: drafts}
+targets:
+  - {id: site, scopes: [open], artifact: public/data/graph.json, exposure: public}
+  - {id: full, scopes: [open, vault], artifact: public/internal-data/graph-internal.json, exposure: restricted}
