@@ -13,7 +13,6 @@ def check(l, c, x=""):
 ROOT = Path(".").resolve()
 cfg = config_reader.load(repo_root=ROOT)
 g, tax = cfg.grammar, cfg.taxonomy
-KINDS = tax.admonition_callout_kind
 CONTRACT = ROOT/"docs/public/adr/platform-infrastructure-audit/01-fact-check-baseline.en.md"
 OPS      = ROOT/"docs/public/adr/platform-infrastructure-audit/01-fact-check-baseline.en.md"
 
@@ -37,7 +36,7 @@ check("extract_frontmatter returns RAW keys (archived_reason survives)",
 md = corpus_reader.document_metadata_of(OPS, g)
 check("document_metadata_of DROPS archived_reason (the documented trap)",
       "archived_reason" not in md and md["status"]=="archived")
-nodes, callouts = corpus_reader.parse_file(g, KINDS, CONTRACT, ROOT)
+nodes, callouts = corpus_reader.parse_file(g, CONTRACT, ROOT)
 check("parse_file finds both contracts", len(nodes)==2)
 check("source_file is the repo-relative POSIX label",
       nodes[0].source_file=="docs/public/adr/platform-infrastructure-audit/01-fact-check-baseline.en.md")
@@ -45,7 +44,19 @@ check("extract_document_title reads the true H1",
       corpus_reader.extract_document_title(g, CONTRACT)=="State Resolution Kernel")
 check("extract_prologue stops at the first block",
       corpus_reader.extract_prologue(g, CONTRACT)=="Prologue prose.")
-n2, c2 = corpus_reader.parse_corpus(g, KINDS, ROOT/"docs", ROOT, "*.en.md")
+# --- Thêm hàm này vào ngay trên test case ---
+def parse_tree(grammar, directory, repo_root, glob):
+    """(nodes, callouts) for every file matching `glob` under `directory`."""
+    all_nodes, all_callouts = [], []
+    for path in sorted(directory.rglob(glob)):
+        from lte.io import corpus_reader # Import nếu chưa có ở đầu file
+        nodes, callouts = corpus_reader.parse_file(grammar, path, repo_root)
+        all_nodes.extend(nodes)
+        all_callouts.extend(callouts)
+    return all_nodes, all_callouts
+
+# --- Sửa dòng 48 bên trong test case thành: ---
+n2, c2 = parse_tree(g, ROOT/"docs", ROOT, "*.en.md")
 check("parse_corpus walks the whole tree", len(n2)==2 and len(c2)==2)
 check("discover_files is SORTED (hash stability across machines)",
       corpus_reader.discover_files(ROOT/"docs","*.md")
@@ -77,9 +88,9 @@ with tempfile.TemporaryDirectory() as td:
     check("stale version -> fresh (never deserialize a foreign shape)",
           build_cache.load_build_cache(tmp)["files"]=={})
     c = build_cache.empty_cache()
-    n,cl,hit = build_cache.cached_or_parse(g, KINDS, CONTRACT, ROOT, c)
+    n,cl,hit = build_cache.cached_or_parse(g, CONTRACT, ROOT, c)
     check("first parse is a miss", hit is False and len(n)==2)
-    n,cl,hit = build_cache.cached_or_parse(g, KINDS, CONTRACT, ROOT, c)
+    n,cl,hit = build_cache.cached_or_parse(g, CONTRACT, ROOT, c)
     check("second is a hit and round-trips SpecNode", hit is True and len(n)==2)
     check("round-tripped node equals freshly parsed",
           [(x.spec_id,x.title,x.content,x.status_override) for x in n]

@@ -4,7 +4,7 @@
 dependent-lifecycle linting over the full corpus.
 
 Replaces scripts/verification_and_testing/validate_markdown.py. Behaviour is
-preserved: same five checks, same report grouping, same exit codes (0 ok /
+preserved: same checks, same report grouping, same exit codes (0 ok /
 1 issues found / 0 under --soft), same --file scoping semantics.
 
 ALWAYS SCANS THE FULL CORPUS -- every walk directory the corpus layout
@@ -13,7 +13,7 @@ compile target a later build will use. This is a single repo-wide lint pass,
 not a target-filtered build step, and it is the one place the cross-boundary
 rule is enforced at all.
 
-The five checks:
+The six checks:
   1. Code fence parity.
   2. Referential integrity (orphan refs, duplicate anchors), per locale.
   3. Partition placement (anchor domain vs. physical directory).
@@ -23,6 +23,10 @@ The five checks:
      a .debate/.ops/.evi file's independent `status`. The only
      severity-driven check; see the loop below and
      config/linter_rules.json's dependent_lifecycle.severity.
+  6. Banned constructs -- admonition openers and Markdown table rows.
+     UNCONDITIONALLY FATAL: unlike check 5 there is no severity knob, because
+     a banned construct silently drops content from the compiled graph rather
+     than producing a debatable warning.
 
 LAYER POSITION. Imports lte.engine (integrity, state_machine) and lte.io
 (config_reader, corpus_reader, build_cache). Imports nothing from lte.cli --
@@ -109,7 +113,6 @@ def run(repo_root: Path, config=None, target: Path | None = None,
     grammar = config.grammar
     taxonomy = config.taxonomy
     layout = config.layout
-    kinds = taxonomy.admonition_callout_kind
 
     corpus_dir = repo_root / layout.root if layout.root else repo_root
     if not corpus_dir.is_dir():
@@ -145,7 +148,7 @@ def run(repo_root: Path, config=None, target: Path | None = None,
     parsed_by_path: dict = {}
     for path in all_md_files:
         nodes, callouts, was_hit = build_cache.cached_or_parse(
-            grammar, kinds, path, repo_root, cache)
+            grammar, path, repo_root, cache)
         parsed_by_path[path] = (nodes, callouts, was_hit)
         if was_hit:
             cache_hits += 1
@@ -194,6 +197,26 @@ def run(repo_root: Path, config=None, target: Path | None = None,
             else:
                 sys.stderr.write("[{0}] {1}\n".format(diag["severity"].upper(), message))
 
+    # --- Check 6: banned constructs (pure-text contraction boundary) ---
+    # UNCONDITIONALLY FATAL, unlike Check 5, which is severity-driven. A
+    # banned construct is not a lifecycle judgement call: an admonition or a
+    # table in a node body parses to nothing, so the document compiles green
+    # while silently losing content. That is the exact failure mode this
+    # grammar was contracted to eliminate, so it joins `entries` and fails
+    # the build -- the same standing as a broken reference in Invariant 1.
+    #
+    # Reads through corpus_reader like every other file access here. Runs on
+    # cache hits too, for the reason the fence check does: a file that
+    # stopped changing is still just as broken.
+    for path in all_md_files:
+        rel_str = rel_of[path]
+        text = corpus_reader.read_document_text(path)
+        for line_no, message in integrity.check_banned_constructs(grammar, rel_str, text):
+            entries.append((
+                "{0}:{1}: BANNED CONSTRUCT -- {2}".format(rel_str, line_no, message),
+                {rel_str},
+            ))
+
     # --- Checks 2-4: per-locale corpus-wide integrity ------------------
     # vi and en are two INDEPENDENT corpora: a vi debate must resolve
     # against a vi anchor. Whether the two agree with each other is a
@@ -218,7 +241,8 @@ def run(repo_root: Path, config=None, target: Path | None = None,
             entries.append((
                 "{0}:{1}: [!{2}-{3}] references '{3}', which has no matching ^{3} anchor "
                 "anywhere in the '{4}' corpus".format(
-                    orphan.source_file, orphan.line_no, orphan.kind, orphan.target_id, lang),
+                    orphan.source_file, orphan.line_no, orphan.token or orphan.kind,
+                    orphan.target_id, lang),
                 {orphan.source_file},
             ))
 
@@ -246,7 +270,8 @@ def run(repo_root: Path, config=None, target: Path | None = None,
                 "{0}:{1}: SECURITY BOUNDARY VIOLATION -- callout [!{2}-{3}] in scope "
                 "'{5}' targets '{3}', which is defined in higher-visibility scope '{6}', "
                 "in the '{4}' corpus".format(
-                    violation.source_file, violation.line_no, violation.kind,
+                    violation.source_file, violation.line_no,
+                    violation.token or violation.kind,
                     violation.target_id, lang, source_scope, target_scope),
                 {violation.source_file},
             ))

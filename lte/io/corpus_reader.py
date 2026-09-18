@@ -4,13 +4,17 @@ disk reads over the corpus tree.
 
 Extracted from the legacy graph_lib.py's Path-taking wrappers:
 extract_frontmatter, document_metadata_of, parse_file,
-extract_document_title, extract_prologue, parse_corpus.
+extract_document_title, extract_prologue.
+
+parse_corpus() was extracted alongside them and then never called by
+anything: discovery went through iter_layout_documents() instead. Removed
+rather than maintained through the pure-text signature change.
 
 THE SHAPE OF THIS MODULE IS THE WHOLE POINT. Every function below is the
 same three steps: resolve a path label, read bytes to text, hand the text to
 a pure function in lte/engine/. There is no parsing logic here at all. If a
-change to this module requires knowing what a `!!! note` block looks like,
-the change belongs in lte/engine/ast_blocks.py instead.
+change to this module requires knowing what a `> [!ref-...]` block looks
+like, the change belongs in lte/engine/ast_blocks.py instead.
 
 EXACTLY ONE read call exists in this module -- read_document_text() below.
 Every wrapper routes through it. That is deliberate: a second inlined
@@ -26,9 +30,8 @@ directory name and no filename suffix of its own; see the Discovery section.
 GRAMMAR IS INJECTED. The engine functions take a Grammar; so do these. The
 legacy signatures had no such parameter because graph_lib built its regexes
 at import time via a file read -- the behavior this whole decomposition
-exists to remove. scripts/graph_lib.py's shim restores the legacy arity for
-legacy callers; see its docstring for why the import-time read legitimately
-lives there and nowhere else.
+exists to remove. scripts/ is deprecated and its shim is gone; the Grammar
+parameter is now the only way these functions learn the token language.
 """
 from __future__ import annotations
 
@@ -143,18 +146,20 @@ def document_metadata_of(path: Path, grammar: Grammar | None = None) -> dict:
 # AST blocks
 # ----------------------------------------------------------------------
 
-def parse_file(grammar: Grammar, callout_kind_by_type, path: Path,
-               repo_root: Path) -> tuple:
-    """Parses one Markdown file into its anchor nodes and reference callouts,
-    recognizing EITHER supported grammar in the same single pass (a file may
-    mix both, block by block).
+def parse_file(grammar: Grammar, path: Path, repo_root: Path) -> tuple:
+    """Parses one Markdown file into its anchor nodes and dependent callouts.
 
     The read happens here; the dispatch happens in
     lte/engine/ast_blocks.parse_text(). Returns (nodes, callouts).
+
+    `callout_kind_by_type` is gone from this signature. It carried
+    Taxonomy.admonition_callout_kind -- the map from an admonition type to a
+    callout kind -- and with Grammar 2 removed the enclosing block no longer
+    decides anything. A dependent block's role now comes from the configured
+    alias table, which reaches the parser on the Grammar it already takes.
     """
     rel_path = relative_label(path, repo_root)
-    return ast_blocks.parse_text(
-        grammar, callout_kind_by_type, rel_path, read_document_text(path))
+    return ast_blocks.parse_text(grammar, rel_path, read_document_text(path))
 
 
 def extract_document_title(grammar: Grammar, path: Path) -> str:
@@ -202,26 +207,6 @@ def discover_files(directory: Path, glob: str) -> list:
     would make lte/validators/compiler_parity.py report a false divergence.
     """
     return sorted(directory.rglob(glob))
-
-
-def parse_corpus(grammar: Grammar, callout_kind_by_type, directory: Path,
-                 repo_root: Path, glob: str) -> tuple:
-    """Parses every file matching `glob` under `directory` and concatenates.
-
-    `glob` is scoped to ONE locale per call; take it from
-    CorpusLayout.discovery_globs(locale). Callers wanting a single compile
-    target should pass that target's partition directories rather than
-    filtering afterward -- a target must never READ a directory of a scope
-    it does not declare, which is the build-time half of the security
-    boundary. discover_layout_files() does exactly that.
-    """
-    all_nodes: list = []
-    all_callouts: list = []
-    for path in discover_files(directory, glob):
-        nodes, callouts = parse_file(grammar, callout_kind_by_type, path, repo_root)
-        all_nodes.extend(nodes)
-        all_callouts.extend(callouts)
-    return all_nodes, all_callouts
 
 
 def iter_documents(directory: Path, repo_root: Path, globs: Sequence[str]) -> Iterable:

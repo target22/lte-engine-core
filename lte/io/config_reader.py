@@ -12,6 +12,12 @@ COMPILE ORDER IS FORCED: taxonomy, then layout, then grammar. The layout is
 validated against the taxonomy's partition rows, and the grammar's filename
 patterns are expanded against the layout's locales and extensions.
 
+THAT ORDER LEAVES A GAP, closed at the bottom of load(). Because taxonomy is
+built first, it cannot see linter_rules.json; because the grammar is
+compiled last, it is handed only the taxonomy's domains. Any rule spanning
+both files therefore has no natural home in either validator and lives as an
+explicit post-hoc assertion here -- see the two calls after compile_grammar.
+
 This is the READ half of the legacy scripts/config_loader.py. Batch 1 moved
 its validation half into lte/engine/grammar.py and lte/engine/taxonomy.py
 and promised this module; here it is. Between them, every rule and every
@@ -41,7 +47,8 @@ import yaml
 
 from lte.engine.grammar import ConfigError, Grammar, compile_grammar
 from lte.engine.layout import CorpusLayout, LayoutError, compile_layout
-from lte.engine.taxonomy import Taxonomy, TaxonomyError, build_taxonomy
+from lte.engine.taxonomy import (Taxonomy, TaxonomyError,
+                                 assert_callout_roles_agree, build_taxonomy)
 
 TAXONOMY_FILENAME = "taxonomy.yaml"
 GRAMMAR_FILENAME = "linter_rules.json"
@@ -185,10 +192,38 @@ def load(config_dir: Path | None = None, repo_root: Path | None = None) -> Engin
         label=str(raw["config_dir"] / GRAMMAR_FILENAME),
         layout=layout,
     )
-    # Cross-check that needs the FINISHED Grammar: a dependent role the
-    # filename pattern cannot emit is dead config that looks live.
+    # Cross-checks that need the FINISHED Grammar, which is why they run
+    # here and not inside either validator. COMPILE ORDER IS FORCED --
+    # taxonomy, then layout, then grammar -- so build_taxonomy() cannot see
+    # linter_rules.json at all, and compile_grammar() is handed only the
+    # taxonomy's domains. Anything spanning both files lands in this gap.
     from lte.engine.grammar import assert_dependent_roles_producible
+
+    # 1. A dependent role the filename pattern cannot emit is dead config
+    #    that looks live.
     assert_dependent_roles_producible(grammar)
+
+    # 2. The two config files each declare a dependent role set --
+    #    ui_projection.yaml's callout_kinds keys and linter_rules.json's
+    #    dependent_lifecycle.dependent_roles -- and neither can see the
+    #    other at its own validation time. A role in only one of them is
+    #    either a KeyError mid-corpus-walk or an array emitted empty on
+    #    every node forever, so the disagreement is caught here or not at
+    #    all.
+    #
+    #    WRAPPED, not allowed to propagate. assert_callout_roles_agree
+    #    raises TaxonomyError; load()'s contract, stated at the top of this
+    #    module and relied on by lte/cli/compile.py's except clause, is that
+    #    every configuration failure surfaces as ConfigError. An unwrapped
+    #    TaxonomyError here would escape that handler and print a traceback
+    #    instead of the FATAL line every other config error produces.
+    try:
+        assert_callout_roles_agree(taxonomy, grammar)
+    except TaxonomyError as exc:
+        raise ConfigError("{0} vs {1}: {2}".format(
+            raw["config_dir"] / UI_PROJECTION_FILENAME,
+            raw["config_dir"] / GRAMMAR_FILENAME, exc)) from exc
+
     return EngineConfig(
         taxonomy=taxonomy, grammar=grammar, layout=layout,
         repo_root=raw["repo_root"], config_dir=raw["config_dir"],

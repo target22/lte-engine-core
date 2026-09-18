@@ -13,14 +13,21 @@ the FULL combined node/callout set on every run, cache hit or not. A cache
 hit means "these bytes parsed to this AST before", never "this file was
 fine before".
 
-CACHE_VERSION STAYS AT 2. The decomposition changed where the parser lives,
-not what it emits: lte/engine/ast_blocks.parse_text() was verified in Batch
-1 to produce byte-identical SpecNode/RefCallout output to the legacy
-parse_file() for the same input, across all 12 compiled patterns. A
-gratuitous bump would discard every cache entry in every working tree and
-CI runner for no behavioural reason. Bump it only when the SERIALIZED SHAPE
-below changes -- a new SpecNode field, a different key layout -- because
-that is what a stale entry would deserialize wrongly.
+CACHE_VERSION IS 3, RAISED FROM 2 BY THE PURE-TEXT GRAMMAR. The rule the
+previous revision stated -- bump only when the SERIALIZED SHAPE changes --
+is exactly what fired here: RefCallout gained `node_id` and `token`. Both
+carry defaults, so a version-2 entry would deserialize SUCCESSFULLY and
+WRONGLY, with node_id="" on every callout. An empty node_id is not a
+cosmetic gap: integrity.find_orphan_refs() adds callout node_ids to its
+known-id set, so every composite reference in the corpus would report as an
+orphan and be dropped from the graph -- on a green build, from a file
+nobody touched.
+
+That is the precise failure the version guard exists to prevent, and it is
+why the defaults are NOT sufficient on their own. The defaults keep
+RefCallout(**c) from raising; the version keeps it from lying. The
+assertion in cached_or_parse() below is a third layer, for the next field
+somebody adds without reading this docstring.
 """
 from __future__ import annotations
 
@@ -49,7 +56,7 @@ from lte.engine.grammar import Grammar
 # cycle. Addressing the module directly removes both problems.
 import lte.io.corpus_reader as corpus_reader
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 CACHE_RELATIVE_PATH = (".cache", "build_state.json")
 
 
@@ -134,7 +141,7 @@ def save_build_cache(repo_root: Path, cache: dict) -> None:
         raise
 
 
-def cached_or_parse(grammar: Grammar, callout_kind_by_type, path: Path,
+def cached_or_parse(grammar: Grammar, path: Path,
                     repo_root: Path, cache: dict) -> tuple:
     """Returns (nodes, callouts, was_cache_hit).
 
@@ -152,6 +159,10 @@ def cached_or_parse(grammar: Grammar, callout_kind_by_type, path: Path,
     an entry written before that field existed still deserializes. That
     safety net is why CACHE_VERSION exists as well: the default handles one
     added optional field, the version handles anything larger.
+
+    `callout_kind_by_type` is gone from this signature along with Grammar 2:
+    the admonition type no longer decides a callout's kind, the configured
+    alias table does, and that table reaches the parser on the Grammar.
     """
     rel = corpus_reader.relative_label(path, repo_root)
     current_hash = compute_file_hash(path)
@@ -160,10 +171,15 @@ def cached_or_parse(grammar: Grammar, callout_kind_by_type, path: Path,
     if entry is not None and entry.get("sha256") == current_hash:
         nodes = [SpecNode(**n) for n in entry["nodes"]]
         callouts = [RefCallout(**c) for c in entry["callouts"]]
-        return nodes, callouts, True
+        # DEFENCE IN DEPTH BEHIND CACHE_VERSION, not a substitute for it.
+        # Every callout the current parser emits has a node_id; one without
+        # came from an older serialized shape that the version check should
+        # have rejected. Falling through would mean silently dropping this
+        # file's composite keys, so treat it as a miss and reparse.
+        if all(c.node_id for c in callouts):
+            return nodes, callouts, True
 
-    nodes, callouts = corpus_reader.parse_file(
-        grammar, callout_kind_by_type, path, repo_root)
+    nodes, callouts = corpus_reader.parse_file(grammar, path, repo_root)
     cache["files"][rel] = {
         "sha256": current_hash,
         "last_validated": datetime.datetime.now(datetime.timezone.utc).isoformat(),

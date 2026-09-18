@@ -26,7 +26,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from lte.engine.grammar import Grammar
 
@@ -66,14 +65,31 @@ class SpecNode:
 
 @dataclass
 class RefCallout:
-    """One Tier-4 inbound reference: a Debate ('ref') or Checklist ('ops')."""
+    """One Tier-4 dependent (Foreign Key) block.
 
-    kind: Literal["ref", "ops"]
+    `kind` is the INTERNAL dependent role -- the closed set
+    dependent_lifecycle.dependent_roles declares, which graph.json, the
+    frontend and the state machine are all keyed on. `token` is the alias the
+    author actually typed, kept only for diagnostics and round-tripping.
+    Renaming an alias in config therefore never changes `kind` or `node_id`.
+
+    NOT Literal[...] any more: the legal values come from config at load
+    time, so an enumeration here would be a second, stale source of truth.
+    """
+
+    kind: str
     target_id: str
     title: str
     content: str
     source_file: str
     line_no: int
+    # Composite Primary Key: <parent_anchor><sep><role>-<letter><ordinal>,
+    # e.g. spec-lte-01-002#debate-d01. Minted by parse_text from the
+    # config's separator and suffix letter -- never spelled in this module.
+    node_id: str = ""
+    # The authored alias ('ref', 'cite', ...). Defaulted so a build-cache
+    # entry written before this field existed still deserializes.
+    token: str = ""
 
     @property
     def source_scope(self) -> str | None:
@@ -90,141 +106,18 @@ class RefCallout:
         return None
 
 
-def collect_admonition_body(grammar: Grammar, lines: list, start: int) -> tuple:
-    """From index `start` (the line right after a matched admonition opener),
-    collects every following line that is blank or indented >=4 spaces,
-    dedenting the indented ones by exactly 4 spaces. Stops at the first
-    non-blank, under-indented line or EOF.
-
-    Trims leading and trailing blank lines: mkdocs tolerates either around
-    the real content, and keeping them would add noise to the stored body.
-
-    Returns (dedented_body_lines, next_index_to_resume_at).
-    """
-    body: list = []
-    j = start
-    n = len(lines)
-    while j < n:
-        line = lines[j]
-        if grammar.admonition_blank.match(line):
-            body.append("")
-            j += 1
-            continue
-        indent_match = grammar.admonition_indent.match(line)
-        if not indent_match:
-            break
-        body.append(indent_match.group("rest"))
-        j += 1
-    while body and body[0] == "":
-        body.pop(0)
-    while body and body[-1] == "":
-        body.pop()
-    return body, j
-
-
-def parse_admonition_block(grammar: Grammar, callout_kind_by_type, block_type: str,
-                           title: str, open_line_no: int, body: list,
-                           rel_path: str) -> tuple:
-    """Turns one already-collected, already-dedented admonition body into
-    either a SpecNode (block_type == 'note') or a RefCallout (block_type in
-    ('warning', 'tip')) -- or NEITHER.
-
-    Returning (None, None) is a valid, silently-skipped state, never a raised
-    error: this is a line-scanner applying a grammar, not a schema validator.
-    lte/validators/corpus.py is the layer that turns "no anchor found" into a
-    build failure if that is ever wanted, not this function.
-
-    `callout_kind_by_type` is Taxonomy.admonition_callout_kind, passed in
-    rather than imported so this module stays free of any taxonomy
-    dependency.
-    """
-    if block_type == "note":
-        anchor_id = None
-        anchor_idx = None
-        for idx in range(len(body) - 1, -1, -1):
-            stripped = body[idx].strip()
-            standalone = grammar.spec_anchor.match(stripped)
-            if standalone:
-                anchor_id = standalone.group("id")
-                anchor_idx = idx
-                body[idx] = None  # the whole line WAS the anchor
-                break
-            trailing = grammar.admonition_trailing_anchor.match(body[idx])
-            if trailing:
-                anchor_id = trailing.group("id")
-                anchor_idx = idx
-                body[idx] = trailing.group("pre")
-                break
-        if anchor_id is None:
-            return None, None  # unanchored note: valid prose, silently unindexed
-
-        # Optional per-contract status override: a standalone
-        # `{status: ...}` line anywhere else in the body. Scanned and
-        # stripped the same way the anchor line is (whole line consumed, not
-        # left behind as rendered prose), but as an INDEPENDENT pass -- it is
-        # not positionally tied to the anchor the way Grammar 1's trailing
-        # style is.
-        status_override = None
-        for idx, line in enumerate(body):
-            if line is None or idx == anchor_idx:
-                continue
-            status_match = grammar.admonition_status.match(line.strip())
-            if status_match:
-                status_override = status_match.group("status")
-                body[idx] = None
-                break
-
-        content = "\n".join(l for l in body if l is not None).strip()
-        return (
-            SpecNode(
-                spec_id=anchor_id, title=title, content=content,
-                source_file=rel_path, line_no=open_line_no,
-                status_override=status_override,
-            ),
-            None,
-        )
-
-    # 'warning' -> ref/debate callout, 'tip' -> ops/checklist callout. Both
-    # use the SAME `[!ref-<id>]` token -- the admonition type, not the token
-    # text, decides kind.
-    ref_idx = None
-    target_id = None
-    ref_title = ""
-    for idx, line in enumerate(body):
-        m = grammar.admonition_ref_line.match(line)
-        if m:
-            ref_idx = idx
-            target_id = m.group("id")
-            ref_title = m.group("title").strip()
-            break
-    if target_id is None:
-        # No [!ref-<id>] link: valid but unlinked, silently skipped. No
-        # positional or proximity guessing at an intended target -- same
-        # no-heuristics stance as unanchored heading sections.
-        return None, None
-
-    remainder = [line for idx, line in enumerate(body) if idx != ref_idx]
-    content = "\n".join(remainder).strip()
-    # A KeyError here means an admonition type reached the grammar's
-    # admonition_open pattern without a matching ui_projection entry --
-    # exactly when this should fail loudly. `note` never reaches this line.
-    kind = callout_kind_by_type[block_type]
-    return None, RefCallout(
-        kind=kind, target_id=target_id, title=ref_title, content=content,
-        source_file=rel_path, line_no=open_line_no,
-    )
-
-
-def parse_text(grammar: Grammar, callout_kind_by_type, rel_path: str,
-               text: str) -> tuple:
+def parse_text(grammar: Grammar, rel_path: str, text: str) -> tuple:
     """THE AST parser. Takes text and a repo-relative path label, never a Path.
 
-    Dispatches per-line across both grammars:
-      * a Grammar-2 admonition opener consumes its whole indented block
-      * a Grammar-1 heading arms a buffer that a later standalone anchor line
-        closes into a SpecNode
-      * a Grammar-1 top-level `> [!ref-...]` / `> [!ops-...]` blockquote
-        becomes a RefCallout
+    Two structural entities, one dispatch:
+      * PRIMARY KEY  -- a heading, free prose, terminated by a line holding
+        only `^<anchor>`. Emits a SpecNode.
+      * FOREIGN KEY  -- a top-level blockquote opened by `> [!<token>-<parent>]`.
+        Emits a RefCallout whose `kind` is the internal role the config maps
+        `<token>` to, and whose `node_id` is a composite child key.
+
+    No token string is written here. The alias set, the role it resolves to,
+    the composite separator and the suffix letter all arrive on `grammar`.
 
     Returns (nodes, callouts).
     """
@@ -235,29 +128,14 @@ def parse_text(grammar: Grammar, callout_kind_by_type, rel_path: str,
     current_heading = None
     current_heading_line = 0
     buffer: list = []
+    # (parent_anchor, role) -> count so far, in document order. Deterministic:
+    # byte-identical input yields byte-identical composite keys.
+    ordinals: dict = {}
 
     i = 0
     n = len(lines)
     while i < n:
         line = lines[i]
-
-        admonition_match = grammar.admonition_open.match(line)
-        if admonition_match:
-            open_line_no = i + 1
-            body, next_i = collect_admonition_body(grammar, lines, i + 1)
-            node, callout = parse_admonition_block(
-                grammar, callout_kind_by_type,
-                admonition_match.group("type"), admonition_match.group("title"),
-                open_line_no, body, rel_path,
-            )
-            if node is not None:
-                nodes.append(node)
-            if callout is not None:
-                callouts.append(callout)
-            i = next_i
-            buffer = []
-            current_heading = None
-            continue
 
         heading_match = grammar.heading.match(line)
         if heading_match:
@@ -270,10 +148,31 @@ def parse_text(grammar: Grammar, callout_kind_by_type, rel_path: str,
         anchor_match = grammar.spec_anchor.match(line.strip())
         if anchor_match and current_heading is not None:
             spec_id = anchor_match.group("id")
-            content = "\n".join(buffer).strip()
+            # Optional per-contract status override: one standalone
+            # `{status: ...}` line anywhere in the block. Captured RAW and
+            # validated by the caller against status_values, exactly as the
+            # document-level front-matter `status` is.
+            #
+            # CARRIED OVER FROM GRAMMAR 2, NOT NEW. parse_admonition_block()
+            # scanned a note block's body for this line; deleting that
+            # function took the feature with it, leaving `status_directive`
+            # compiled in config and read by nothing, while
+            # graph_builder.effective_node_status() and
+            # payload_lock.effective_statuses() both kept asking for an
+            # override that could no longer exist.
+            status_override, kept = None, []
+            for buffered in buffer:
+                directive = (grammar.status_directive.match(buffered.strip())
+                             if status_override is None else None)
+                if directive:
+                    status_override = directive.group("status")
+                    continue  # whole line consumed, never rendered as prose
+                kept.append(buffered)
+            content = "\n".join(kept).strip()
             nodes.append(SpecNode(
                 spec_id=spec_id, title=current_heading, content=content,
                 source_file=rel_path, line_no=current_heading_line,
+                status_override=status_override,
             ))
             buffer = []
             i += 1
@@ -281,7 +180,11 @@ def parse_text(grammar: Grammar, callout_kind_by_type, rel_path: str,
 
         callout_match = grammar.ref_callout_start.match(line)
         if callout_match:
-            kind = callout_match.group("kind")
+            token = callout_match.group("kind")
+            # Alias -> internal role. The pattern only admits configured
+            # tokens, so this lookup cannot miss; .get would hide a config
+            # drift between the compiled alternation and the alias table.
+            kind = grammar.callout_kind_aliases[token]
             target_id = callout_match.group("id")
             title = callout_match.group("title").strip()
             callout_line_no = i + 1
@@ -293,10 +196,15 @@ def parse_text(grammar: Grammar, callout_kind_by_type, rel_path: str,
                     break
                 body_lines.append(bq_match.group(1))
                 j += 1
+            seq = ordinals[(target_id, kind)] = ordinals.get((target_id, kind), 0) + 1
             callouts.append(RefCallout(
                 kind=kind, target_id=target_id, title=title,
                 content="\n".join(body_lines).strip(),
                 source_file=rel_path, line_no=callout_line_no,
+                node_id="{0}{1}{2}-{3}{4:02d}".format(
+                    target_id, grammar.composite_separator, kind,
+                    grammar.callout_suffix_letters[kind], seq),
+                token=token,
             ))
             i = j
             buffer = []
@@ -332,8 +240,8 @@ def title_from_text(grammar: Grammar, text: str, fallback: str) -> str:
 
 
 def prologue_from_text(grammar: Grammar, text: str) -> str:
-    """Raw Markdown of whatever sits BEFORE the first recognized AST block --
-    a Grammar-2 admonition opener or a Grammar-1 top-level ref/ops callout.
+    """Raw Markdown of whatever sits BEFORE the first top-level dependent
+    blockquote.
 
     A leading YAML front matter fence and the document's own true H1 title
     line are stripped first, since both are surfaced elsewhere (front matter
@@ -369,7 +277,7 @@ def prologue_from_text(grammar: Grammar, text: str) -> str:
     collected: list = []
     while i < n:
         line = lines[i]
-        if grammar.admonition_open.match(line) or grammar.ref_callout_start.match(line):
+        if grammar.ref_callout_start.match(line):
             break
         collected.append(line)
         i += 1

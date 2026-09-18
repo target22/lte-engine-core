@@ -1,7 +1,7 @@
 {
   "config_version": "1.0.0",
   "_comment_identity": [
-    "config/linter_rules.json — the externalized AST grammar for the linter",
+    "config/linter_rules.json \u2014 the externalized AST grammar for the linter",
     "(validate_markdown.py) and the parser (parse_graph.py / git_cas.py), both of",
     "which reach it through graph_lib.py.",
     "",
@@ -15,15 +15,15 @@
   ],
   "_comment_purpose": [
     "Patterns are TEMPLATES, not finished regexes: the loader substitutes the",
-    "placeholders below before compiling. This is deliberate — the anchor-matching",
+    "placeholders below before compiling. This is deliberate \u2014 the anchor-matching",
     "patterns depend on the live domain list in config/taxonomy.yaml, and freezing a",
     "literal domain alternation into this file would create a second source of truth",
     "for the taxonomy that silently desyncs the moment a partition is added."
   ],
   "_comment_substitution": [
     "SUBSTITUTION IS .replace(), NEVER str.format(). Three patterns contain literal",
-    "regex braces — heading's {1,6}, admonition_indent's {4}, and admonition_status's",
-    "literal '{status:' / '\\\\}' — which str.format() would either raise on or silently",
+    "regex braces \u2014 heading's {1,6}, admonition_indent's {4}, and admonition_status's",
+    "literal '{status:' / '\\\\}' \u2014 which str.format() would either raise on or silently",
     "mangle. The loader performs exact token replacement of every placeholder listed",
     "under `placeholders`, then rejects ANY surviving brace-wrapped identifier: an",
     "unknown token such as {node_id} is a valid regex (Python treats a non-quantifier",
@@ -56,6 +56,7 @@
   ],
   "document_roles": [
     "contract",
+    "axiom",
     "debate",
     "ops"
   ],
@@ -70,36 +71,32 @@
     "The closed status lexicon (graph_lib.py's STATUS_VALUES). public/app.js carries",
     "its own STATUS_BADGE_CLASS map over these same five values plus the",
     "compiler-generated 'ast_non_compliant'. That frontend map is a separate,",
-    "unsynchronized copy and is NOT loaded from this file — a zero-build static SPA",
+    "unsynchronized copy and is NOT loaded from this file \u2014 a zero-build static SPA",
     "cannot import a Python-side config. Adding a sixth value here renders as",
     "badge-ghost via app.js's `||` fallback, silently."
   ],
   "patterns": {
     "spec_anchor": "^\\^(?P<id>{anchor_id})\\s*$",
     "heading": "^(#{1,6})\\s+(.*\\S)\\s*$",
-    "ref_callout_start": "^>\\s*\\[!(?P<kind>ref|ops)-(?P<id>{anchor_id})\\]\\s*(?P<title>.*)$",
+    "ref_callout_start": "^>\\s*\\[!(?P<kind>{kind_alt})-(?P<id>{composite_id}|{anchor_id})\\]\\s*(?P<title>.*)$",
     "blockquote_line": "^>\\s?(.*)$",
-    "admonition_open": "^(?P<marker>!!!|\\?\\?\\?\\+)\\s+(?P<type>note|warning|tip)\\s+\"(?P<title>[^\"]*)\"\\s*$",
-    "admonition_indent": "^ {4}(?P<rest>.*)$",
-    "admonition_blank": "^\\s*$",
-    "admonition_trailing_anchor": "^(?P<pre>.*?)\\s*\\^(?P<id>{anchor_id})\\s*$",
-    "admonition_ref_line": "^>\\s*\\[!ref-(?P<id>{anchor_id})\\]\\s*(?P<title>.*)$",
-    "admonition_status": "^\\{status:\\s*(?P<status>[A-Za-z][A-Za-z0-9_-]*)\\s*\\}$",
     "split_document": "^(?P<slug>.+)\\.(?P<role>{role_alt}){locale_sep}(?P<lang>{locale_alt}){extension_pattern}$",
     "document_h1": "^#\\s+(.*\\S)\\s*$",
-    "frontmatter_fence": "^---\\s*$"
+    "frontmatter_fence": "^---\\s*$",
+    "status_directive": "^\\{status:\\s*(?P<status>[A-Za-z][A-Za-z0-9_-]*)\\s*\\}$",
+    "subblock_suffix": "-(?:{subblock_letter_alt})[0-9]+$"
   },
   "_comment_grammar_split": [
     "GRAMMAR 1 (legacy heading style): heading + spec_anchor + ref_callout_start +",
     "blockquote_line. A Markdown heading of any level, arbitrary content, terminated",
     "by a line containing only ^<domain>-<id>. Its callouts carry the kind in the",
-    "token itself — [!ref-...] vs [!ops-...] — captured by ref_callout_start's",
+    "token itself \u2014 [!ref-...] vs [!ops-...] \u2014 captured by ref_callout_start's",
     "(?P<kind>ref|ops) group.",
     "",
     "GRAMMAR 2 (MkDocs-Material admonitions): the admonition_* patterns. Deeper",
     "hierarchical anchor ids, 4-space-indented bodies. Exactly ONE link token,",
     "[!ref-...], for both warning and tip blocks; whether the result is a debate or a",
-    "checklist is decided by the enclosing admonition type, not the token text — see",
+    "checklist is decided by the enclosing admonition type, not the token text \u2014 see",
     "config/ui_projection.yaml's admonitions.<type>.callout_kind.",
     "",
     "Both grammars are live simultaneously and produce identical SpecNode/RefCallout",
@@ -115,51 +112,35 @@
       "id",
       "title"
     ],
-    "admonition_open": [
-      "marker",
-      "type",
-      "title"
-    ],
-    "admonition_indent": [
-      "rest"
-    ],
-    "admonition_trailing_anchor": [
-      "pre",
-      "id"
-    ],
-    "admonition_ref_line": [
-      "id",
-      "title"
-    ],
-    "admonition_status": [
-      "status"
-    ],
     "split_document": [
       "slug",
       "role",
       "lang"
+    ],
+    "status_directive": [
+      "status"
     ]
   },
   "required_group_counts": {
     "heading": 2,
     "blockquote_line": 1,
     "document_h1": 1,
-    "admonition_blank": 0,
-    "frontmatter_fence": 0
+    "frontmatter_fence": 0,
+    "subblock_suffix": 0
   },
   "_comment_required_groups": [
     "Fail-fast contract. Every call site reaches into these patterns by group NAME or",
     "positional index. Without these assertions a dropped '?P<id>' would compile",
-    "cleanly and parse the whole corpus to zero nodes — which the pipeline would then",
+    "cleanly and parse the whole corpus to zero nodes \u2014 which the pipeline would then",
     "report as an empty-but-valid document set, not as a broken grammar."
   ],
   "diagnostic_patterns": {
     "_comment": [
-      "QUARANTINED SECTION — DO NOT UNIFY THESE WITH `patterns` ABOVE.",
+      "QUARANTINED SECTION \u2014 DO NOT UNIFY THESE WITH `patterns` ABOVE.",
       "",
       "ingest.py's check_likely_typos() uses these two DELIBERATELY PERMISSIVE",
       "patterns to emit WARN-only nudges: they match a line that looks like it is",
-      "TRYING to be an anchor or a ref callout but does not match the real grammar —",
+      "TRYING to be an anchor or a ref callout but does not match the real grammar \u2014",
       "most often a typo'd domain such as ^specint-001. The author then finds out at",
       "ingest time instead of discovering months later that a block was silently",
       "unindexed.",
@@ -167,29 +148,33 @@
       "Their looseness is the entire point. They accept [A-Za-z0-9-]+ where the real",
       "grammar accepts only a KNOWN domain. 'Tightening' them to the strict patterns",
       "would make them match only VALID anchors, so check_likely_typos() would warn",
-      "about nothing and the diagnostic would be silently lost — no error, no test",
+      "about nothing and the diagnostic would be silently lost \u2014 no error, no test",
       "failure, just a check that stopped checking.",
       "",
       "They take no placeholders and are compiled as literals.",
       "",
       "Explicitly NOT extracted into this file: parse_graph.py's _TAG_RE,",
       "_WHITESPACE_RE and _SPACE_BEFORE_PUNCT_RE. Those are HTML-stripping and",
-      "whitespace-normalizing helpers inside plain_text_summary() — rendering",
+      "whitespace-normalizing helpers inside plain_text_summary() \u2014 rendering",
       "internals, not AST grammar. Externalizing them would put presentation-layer",
       "mechanics into a file the linter treats as the domain contract. Likewise the",
       "repair-tool patterns in fix_markdown.py / fix_domain_typo.py and the tag",
       "patterns in extract_public.py: those tools are deliberately loose in their own",
       "distinct ways and are not part of the parse contract.",
       "",
-      "validate_markdown.py defines no regexes of its own — it derives everything",
+      "validate_markdown.py defines no regexes of its own \u2014 it derives everything",
       "from graph_lib.py. Confirmed by grep; nothing to extract there."
     ],
     "loose_anchor_line": "^\\s*\\^([A-Za-z0-9-]+)\\s*$",
-    "loose_ref_line": "^\\s*>\\s*\\[!([A-Za-z0-9-]+)\\]"
+    "loose_ref_line": "^\\s*>\\s*\\[!([A-Za-z0-9-]+)\\]",
+    "loose_admonition_open": "^(?:!!!|\\?\\?\\?\\+?)\\s+\\S.*$",
+    "loose_table_row": "^\\s*\\|.*\\|\\s*$"
   },
   "diagnostic_required_group_counts": {
     "loose_anchor_line": 1,
-    "loose_ref_line": 1
+    "loose_ref_line": 1,
+    "loose_admonition_open": 0,
+    "loose_table_row": 0
   },
   "file_naming": {
     "_comment": [
@@ -226,6 +211,7 @@
     ],
     "roles": [
       "contract",
+      "axiom",
       "debate",
       "ops",
       "evi"
@@ -359,5 +345,41 @@
       "warn",
       "fail"
     ]
-  }
+  },
+  "callout_kinds": {
+    "_comment": [
+      "CONFIGURABLE VOCABULARY. `aliases` maps the AUTHORED token in",
+      "`> [!<token>-<anchor>]` to an INTERNAL dependent role. The token is",
+      "user-facing and free; the role is the closed set the JSON schema, the",
+      "frontend and dependent_lifecycle.dependent_roles are all keyed on.",
+      "Rename `ref` to `cite` here and the corpus changes; graph.json does not.",
+      "`kind_alternation_sort: length_desc` for the same RE2 reason as domains.",
+      "`suffix_letters` supplies the composite-id letter per role, so no letter",
+      "is spelled in Python. `separator` must not be in [A-Za-z0-9-] or a",
+      "composite id would be indistinguishable from a plain anchor.",
+      "`subblock_letters` is the CLOSED set of hierarchical suffix letters.",
+      "It must be a superset of suffix_letters' values; 'c' (clause) has no",
+      "dependent role and exists only as an authored sub-anchor. Narrowing this",
+      "set is what keeps `^spec-lte-01-002-x99` from being read as a child."
+    ],
+    "kind_alternation_sort": "length_desc",
+    "aliases": {
+      "ref": "debate",
+      "ops": "ops",
+      "evi": "evi"
+    },
+    "suffix_letters": {
+      "debate": "d",
+      "ops": "p",
+      "evi": "e"
+    },
+    "separator": "#",
+    "subblock_letters": [
+      "c",
+      "d",
+      "p",
+      "e"
+    ]
+  },
+  "composite_id_template": "(?:{anchor_id}){composite_sep}(?:{dependent_role_alt})-[A-Za-z0-9]+"
 }

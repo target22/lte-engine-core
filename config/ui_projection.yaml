@@ -3,17 +3,30 @@
 # TRI-PANE PROJECTION CONTRACT — the mapping from a parsed AST block to
 # (a) which pane renders it and (b) which Layer 1/2/3 label it carries.
 #
-# Replaces three hardcoded ternaries in scripts/graph_lib.py:
-#   contract_layer_of()  -> "KERNEL_CONTRACT" if partition in _KERNEL_FLAVORED_PARTITIONS else "POLICY_CONTRACT"
-#   debate_layer_of()    -> "TECHNICAL_DEBATE" if ... else "POLICY_DEBATE"
-#   ops_layer_of()       -> "OPERATIONAL_EXTENSIONS" if ... else "EXECUTION_CHECKLIST"
-# ...and one in _parse_admonition_block():
-#   kind = "ref" if block_type == "warning" else "ops"
+# KEYED ON INTERNAL ROLES, NOT AUTHORED TOKENS. The previous revision keyed
+# `callout_kinds:` on `ref:`/`ops:` -- the tokens an author types. Those are
+# now renameable in config/linter_rules.json#callout_kinds.aliases, so keying
+# a layer table on them would move every label the moment somebody renamed a
+# token. The keys below are the internal dependent roles
+# (linter_rules.json#dependent_lifecycle.dependent_roles), which no config
+# edit can rename.
+#
+# THE `admonitions:` BLOCK IS GONE with Grammar 2. Note that it was the only
+# block validate_ui_projection() ever read: the old `callout_kinds:` block
+# was dead config, and every Grammar-1 callout resolved its layer through the
+# ADMONITION table (debate_layer_of -> layer_for("warning", ...)). Deleting
+# the admonition block without the taxonomy.py patch in the same commit
+# therefore removes layer resolution entirely, not just a legacy path.
+#
+# `graph_key` is the array name this role's entries occupy on a contract node
+# in graph.json. `debates` and `ops` keep their historical names so app.js is
+# unaffected; `evidence` is new and app.js does not read it yet.
 #
 # SCOPE OF THIS FILE — read this before assuming it drives the UI.
 # The `layer` string emitted into graph.json is what this file controls, and
-# that string IS consumed by the compiler (parse_graph.py:350/397/400 and
-# git_cas.py:591/616/619). The `pane` field below is DESCRIPTIVE: public/app.js
+# that string IS consumed by the compiler (lte/engine/graph_builder.py, via
+# Taxonomy.contract_layer_of / callout_layer_of). The `pane` field below is
+# DESCRIPTIVE: public/app.js
 # does not currently read `layer` at all — it selects panes from the nested
 # document/node/debates/ops structure directly. Changing `pane` here therefore
 # changes documentation, not rendering, until app.js is taught to read it.
@@ -34,22 +47,23 @@ panes:
   middle:
     role: contract_body
     renders: "Tier 4 contract nodes, plus prologue_html when node_count == 0"
-    layers: ["KERNEL_CONTRACT", "POLICY_CONTRACT"]
+    layers: ["KERNEL_CONTRACT", "POLICY_CONTRACT", "META_CONSTITUTION"]
 
   right:
     role: contextual_annotations
-    renders: "Tier 4 debates and ops/checklist entries, nested under their target contract node"
-    layers: ["TECHNICAL_DEBATE", "POLICY_DEBATE", "OPERATIONAL_EXTENSIONS", "EXECUTION_CHECKLIST"]
+    renders: "Tier 4 debate, ops/checklist and evidence entries, nested under their target contract node"
+    layers: ["TECHNICAL_DEBATE", "POLICY_DEBATE", "META_DEBATE",
+             "OPERATIONAL_EXTENSIONS", "EXECUTION_CHECKLIST", "META_CHECKLIST",
+             "TECHNICAL_EVIDENCE", "COMPLIANCE_EVIDENCE", "META_EVIDENCE"]
 
-# Admonition type -> AST role. `layer_by_flavor` is keyed on the `flavor`
+# Contract (Primary Key) nodes. `layer_by_flavor` is keyed on the `flavor`
 # field of config/taxonomy.yaml. Every flavor declared there MUST appear in
-# every layer_by_flavor map below; the loader raises ConfigError otherwise,
-# so adding a third flavor can never silently fall through to a default.
-admonitions:
-  note:
-    ast_role: contract
-    emits: node
+# every layer_by_flavor map below; validate_ui_projection raises TaxonomyError
+# otherwise, so adding a fourth flavor can never silently fall through.
+node_projection:
+  contract:
     pane: middle
+    emits: node
     layer_by_flavor:
       kernel: KERNEL_CONTRACT
       policy: POLICY_CONTRACT
@@ -58,54 +72,44 @@ admonitions:
       # strings have exactly one home.
       meta: META_CONSTITUTION
 
-  warning:
-    ast_role: debate
-    emits: callout
-    callout_kind: ref
-    pane: right
-    layer_by_flavor:
-      kernel: TECHNICAL_DEBATE
-      policy: POLICY_DEBATE
-      # FLAGGED: the brief specified only the Layer 1 label for axioms.
-      # Layers 2 and 3 below are my choice -- a distinct flavor with a
-      # distinct label triple. Reusing TECHNICAL_DEBATE/OPERATIONAL_
-      # EXTENSIONS instead is equally safe (app.js reads no layer strings
-      # today); confirm which you want.
-      meta: META_DEBATE
-
-  tip:
-    ast_role: ops
-    emits: callout
-    callout_kind: ops
-    pane: right
-    layer_by_flavor:
-      kernel: OPERATIONAL_EXTENSIONS
-      policy: EXECUTION_CHECKLIST
-      meta: META_CHECKLIST
-
-# Grammar 1's top-level blockquote callouts carry their kind in the token
-# itself ([!ref-...] / [!ops-...]) rather than in an enclosing admonition.
-# Mapped here so both grammars resolve a layer label through one table.
+# Dependent (Foreign Key) blocks, keyed on INTERNAL ROLE. The authored token
+# that resolves to each role lives in linter_rules.json#callout_kinds.aliases
+# and is deliberately absent here -- one concept, one home.
 callout_kinds:
-  ref:
-    ast_role: debate
+  debate:
+    graph_key: debates
     pane: right
     layer_by_flavor:
       kernel: TECHNICAL_DEBATE
       policy: POLICY_DEBATE
-      # FLAGGED: the brief specified only the Layer 1 label for axioms.
-      # Layers 2 and 3 below are my choice -- a distinct flavor with a
-      # distinct label triple. Reusing TECHNICAL_DEBATE/OPERATIONAL_
-      # EXTENSIONS instead is equally safe (app.js reads no layer strings
-      # today); confirm which you want.
+      # FLAGGED, carried over: the brief specified only the Layer 1 label for
+      # axioms. Layers 2 and 3 are a choice -- a distinct flavor with a
+      # distinct label triple. Reusing the kernel labels is equally safe
+      # (app.js reads no layer strings today); confirm which you want.
       meta: META_DEBATE
+
   ops:
-    ast_role: ops
+    graph_key: ops
     pane: right
     layer_by_flavor:
       kernel: OPERATIONAL_EXTENSIONS
       policy: EXECUTION_CHECKLIST
       meta: META_CHECKLIST
+
+  evi:
+    # NEW ARRAY. app.js does not read `evidence` yet, so entries compile and
+    # are indexed but do not render. Additive: nothing breaks until it does.
+    graph_key: evidence
+    pane: right
+    layer_by_flavor:
+      # FLAGGED: these three labels are my choice, not from any brief. The
+      # naming follows the existing pairs (TECHNICAL_* for kernel,
+      # execution/compliance wording for policy). Rename freely before the
+      # frontend starts reading them -- after that they are a public
+      # contract.
+      kernel: TECHNICAL_EVIDENCE
+      policy: COMPLIANCE_EVIDENCE
+      meta: META_EVIDENCE
 
 # Document lifecycle projection (Task 2). Declares what the frontend should
 # render for the new frontmatter fields. Nothing reads this yet — it is the

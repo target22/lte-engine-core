@@ -115,14 +115,33 @@ def build_anchor_index(partitions_out):
                     "document_id": doc["document_id"],
                     "partition": partition["id"],
                     "title": node["title"],
+                    "parent_anchor": node.get("parent_anchor"),
                 }
+                # Composite child keys are addressable link targets, so they
+                # belong in the index a deep link resolves against. They
+                # carry the parent's src/document_id because that is where a
+                # reader lands.
+                for key, entries in node.items():
+                    if not isinstance(entries, list):
+                        continue
+                    for entry in entries:
+                        child_id = entry.get("node_id")
+                        if not child_id:
+                            continue
+                        index[child_id] = {
+                            "src": doc["src"],
+                            "document_id": doc["document_id"],
+                            "partition": partition["id"],
+                            "title": entry["title"],
+                            "parent_anchor": node["anchor_id"],
+                        }
     return index
 
 
 # ------------------------------------------------------------- assembly
 
 def build_lang_graph(documents, lang, scope, *,
-                     layout, parse_text, render, metadata_from_text, resolve_dependent_status,
+                     layout, parse_text, parent_anchor_of, render, metadata_from_text, resolve_dependent_status,
                      taxonomy, summarize, normalize_status, title_from_text,
                      prologue_from_text,
                      find_duplicate_spec_ids, find_misplaced_anchors, find_orphan_refs,
@@ -204,7 +223,8 @@ def build_lang_graph(documents, lang, scope, *,
         orphan = _unwrap(orphan)
         _emit(diagnostics, "warn", "orphan_ref",
               "Dropping [!%s-%s] in %s:%s: no matching anchor in the '%s' corpus"
-              % (orphan.kind, orphan.target_id, orphan.source_file, orphan.line_no, lang))
+              % (orphan.token or orphan.kind, orphan.target_id, orphan.source_file,
+                 orphan.line_no, lang))
 
     if exclude_cross_boundary:
         for violation in find_cross_boundary_refs(all_nodes, all_callouts):
@@ -253,6 +273,10 @@ def build_lang_graph(documents, lang, scope, *,
         return file_status_by_path.get(home_rel)
 
     # --- 6. Tier-4 contract nodes ---------------------------------------
+    # role -> graph.json array key, from config. Ordered so the emitted key
+    # order is stable across runs (graph_hash depends on it).
+    callout_graph_keys = [taxonomy.callout_graph_key(role)
+                          for role in taxonomy.dependent_roles]
     nodes_by_id = {}
     node_home = {}
     for rel in ordered_paths:
@@ -262,23 +286,51 @@ def build_lang_graph(documents, lang, scope, *,
         for node in nodes_by_path[rel]:
             if node.spec_id in excluded_anchor_ids:
                 continue
-            nodes_by_id[node.spec_id] = {
+            entry = {
                 "anchor_id": node.spec_id,
                 "title": node.title,
                 "layer": taxonomy.contract_layer_of(pid),
                 "body": render(node.content),
                 "status": effective_node_status(node, rel),
-                "debates": [],
-                "ops": [],
+                # Parent-child edge for an authored sub-anchor. Filled in
+                # step 6b, once every anchor in the corpus is known -- a
+                # prefix may be defined in a file compiled after this one.
+                "parent_anchor": None,
             }
+            # One array per dependent role, named by the role table rather
+            # than spelled here. `debates` and `ops` keep their historical
+            # key names via graph_key so app.js is unaffected; a role added
+            # to config appears as a new array with no code change.
+            for graph_key in callout_graph_keys:
+                entry[graph_key] = []
+            nodes_by_id[node.spec_id] = entry
             node_home[node.spec_id] = rel
+
+    # --- 6b. hierarchical parent edges ----------------------------------
+    # Runs after every node is registered: parent_anchor_of() resolves only
+    # against anchors that actually exist, so a sub-anchor whose prefix is
+    # undefined stays a top-level node instead of inventing a parent.
+    for anchor_id, node_dict in nodes_by_id.items():
+        node_dict["parent_anchor"] = parent_anchor_of(anchor_id, nodes_by_id)
 
     # --- 7. Tier-4 callouts, cascading deprecation ----------------------
     for rel in ordered_paths:
         if rel in excluded_files:
             continue
         for callout in callouts_by_path[rel]:
-            target = nodes_by_id.get(callout.target_id)
+            # A callout may cite a contract, an authored sub-anchor, or
+            # another callout's composite key. Walk up to the contract node
+            # that owns the cited id; the precise target is preserved on the
+            # entry as "targets" so the edge is not lost by the attachment.
+            resolved_id = callout.target_id
+            seen = set()
+            while resolved_id not in nodes_by_id and resolved_id not in seen:
+                seen.add(resolved_id)
+                parent = parent_anchor_of(resolved_id, nodes_by_id)
+                if parent is None:
+                    break
+                resolved_id = parent
+            target = nodes_by_id.get(resolved_id)
             if target is None:
                 continue
             contract_status = target["status"]
@@ -287,9 +339,14 @@ def build_lang_graph(documents, lang, scope, *,
             # matter declares the dependent's independent lifecycle.
             dependent_status = file_status_by_path.get(rel)
             entry = {
+                "node_id": callout.node_id,
                 "title": callout.title,
                 "body": render(callout.content),
                 "source_file": callout.source_file,
+                # The id the author actually cited. Equals anchor_id for a
+                # direct contract reference; a composite or sub-anchor id
+                # when the callout attaches to something finer-grained.
+                "targets": callout.target_id,
                 "contract_status": contract_status,
                 "dependent_status": dependent_status,
                 "computed_status": resolve_dependent_status(contract_status, dependent_status),
@@ -297,13 +354,12 @@ def build_lang_graph(documents, lang, scope, *,
                 # computed_status == invalidated; two questions, two fields.
                 "invalidated": contract_status == DEPRECATED,
             }
-            target_pid = partition_by_path[node_home[callout.target_id]]
-            if callout.kind == "ref":
-                entry["layer"] = taxonomy.debate_layer_of(target_pid)
-                target["debates"].append(entry)
-            else:
-                entry["layer"] = taxonomy.ops_layer_of(target_pid)
-                target["ops"].append(entry)
+            target_pid = partition_by_path[node_home[resolved_id]]
+            # Role-keyed. The previous two-branch form routed every
+            # non-'ref' kind into "ops", which silently swallowed any third
+            # role the config declares.
+            entry["layer"] = taxonomy.callout_layer_of(callout.kind, target_pid)
+            target[taxonomy.callout_graph_key(callout.kind)].append(entry)
 
     grouped_nodes_by_path = {}
     for spec_id, node_dict in nodes_by_id.items():

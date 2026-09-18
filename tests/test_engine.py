@@ -103,7 +103,7 @@ Grammar-1 body text.
 > [!ops-spec-lte-01-002] Legacy ops callout
 > Body line.
 '''
-nodes, callouts = ast_blocks.parse_text(g, tax.admonition_callout_kind, 'docs/public/core/x.en.md', DOC)
+nodes, callouts = ast_blocks.parse_text(g, 'docs/public/core/x.en.md', DOC)
 check("both grammars parsed in one pass: 2 nodes", len(nodes)==2, [n.spec_id for n in nodes])
 check("3 callouts (warning, tip, legacy ops)", len(callouts)==3, [(c.kind,c.target_id) for c in callouts])
 check("warning -> 'ref', tip -> 'ops' by admonition TYPE not token text",
@@ -120,10 +120,10 @@ check("title_from_text reads the true H1 only",
 check("title_from_text falls back when no H1",
       ast_blocks.title_from_text(g, 'no heading here', 'the-doc-id')=='the-doc-id')
 check("unanchored note block is silently unindexed, not an error",
-      ast_blocks.parse_text(g, tax.admonition_callout_kind, 'x.md',
+      ast_blocks.parse_text(g, 'x.md',
         '!!! note "T"\n\n    body with no anchor\n')==([],[]))
 check("unlinked warning block silently skipped -- no positional guessing",
-      ast_blocks.parse_text(g, tax.admonition_callout_kind, 'x.md',
+      ast_blocks.parse_text(g, 'x.md',
         '???+ warning "T"\n\n    no ref line\n')==([],[]))
 check("split-file siblings share one document_id",
       ast_blocks.document_id_from_name(g,'01-x.contract.en.md')

@@ -45,6 +45,12 @@ def find_orphan_refs(nodes: Sequence[SpecNode],
     Needs no taxonomy: this is pure set membership over anchor ids.
     """
     known_ids = {n.spec_id for n in nodes}
+    # Composite child keys are addressable targets too: a debate may cite
+    # another debate. Callouts are fully parsed before this runs, so the set
+    # is complete -- this is not an ordering hazard. A callout citing its own
+    # node_id resolves to itself; that is a corpus authoring question, not a
+    # referential-integrity one, and is deliberately not flagged here.
+    known_ids.update(c.node_id for c in callouts if c.node_id)
     return [c for c in callouts if c.target_id not in known_ids]
 
 
@@ -220,8 +226,9 @@ def check_all(layout: CorpusLayout, taxonomy: Taxonomy, grammar: Grammar,
 
     for callout in find_orphan_refs(nodes, callouts):
         problems.append(
-            "{0}:{1}: [!ref-{2}] targets an anchor that exists nowhere in this "
-            "corpus".format(callout.source_file, callout.line_no, callout.target_id))
+            "{0}:{1}: [!{2}-{3}] targets an anchor that exists nowhere in this "
+            "corpus".format(callout.source_file, callout.line_no,
+                            callout.token or callout.kind, callout.target_id))
 
     for anchor_id, duplicates in sorted(find_duplicate_spec_ids(nodes).items()):
         where = ", ".join(
@@ -241,3 +248,60 @@ def check_all(layout: CorpusLayout, taxonomy: Taxonomy, grammar: Grammar,
                 node.source_file, node.line_no, node.spec_id, expected, actual or "?"))
 
     return problems
+
+
+def parent_anchor_of(grammar: Grammar, anchor_id: str, known_ids) -> str | None:
+    """The parent of a hierarchical sub-anchor, or None.
+
+    TWO SHAPES, ONE ANSWER. A composite child key minted by the parser
+    (`<parent><sep><role>-<letter><nn>`) splits on the configured separator.
+    An AUTHORED sub-anchor (`^spec-lte-01-002-c01`) is structurally a PEER of
+    its prefix -- `(?:-[A-Za-z0-9]+)+` cannot tell a clause from an
+    independent anchor -- so parenthood is established only when BOTH hold:
+    the trailing segment matches the configured sub-block suffix pattern,
+    AND the remaining prefix exists as a real anchor in `known_ids`.
+
+    That second condition is what keeps this exact-match rather than
+    inference: an anchor whose last segment merely looks like `-c01` but
+    whose prefix names nothing stays a top-level node. No edit distance, no
+    "probably a clause of", no nearest-prefix search.
+    """
+    sep = grammar.composite_separator
+    if sep in anchor_id:
+        parent = anchor_id.split(sep, 1)[0]
+        return parent if parent in known_ids else None
+    match = grammar.subblock_suffix.search(anchor_id)
+    if not match:
+        return None
+    parent = anchor_id[: match.start()]
+    return parent if parent in known_ids else None
+
+
+def check_banned_constructs(grammar: Grammar, rel_path: str, text: str) -> list:
+    """Pure-text violations: admonition openers and Markdown table rows.
+
+    Pure and print-free like every check here, but its CALLER has no
+    discretion: lte/validators/corpus.py treats every finding as fatal. The
+    reason is asymmetry of failure -- a banned construct does not render
+    wrongly, it parses to nothing, so the build goes green while content
+    disappears. That is the failure this grammar exists to prevent.
+
+    Deliberately line-based and deliberately not fence-aware, matching
+    parse_text's own known limitation: a pipe table or an admonition opener
+    inside a ``` fence is reported. A false positive that costs one fence
+    rewrite is cheaper than a false negative that silently empties a node.
+
+    Returns [(line_no, message)]; empty for a conforming file.
+    """
+    findings: list = []
+    for line_no, line in enumerate(text.splitlines(), 1):
+        if grammar.loose_admonition_open.match(line):
+            findings.append((line_no,
+                "admonition blocks are not parsed by this grammar and compile to "
+                "nothing. Use a heading terminated by a bare ^anchor, or a top-level "
+                "'>' dependent block."))
+        elif grammar.loose_table_row.match(line):
+            findings.append((line_no,
+                "Markdown tables are banned in node bodies. Express tabular rules as "
+                "separately anchored sub-blocks."))
+    return findings

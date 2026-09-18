@@ -17,6 +17,10 @@ grammar-/taxonomy-taking functions into the plain callables graph_builder
 expects (bind_collaborators), write through lte.io.artifact_writer, and map
 the outcome to an exit code. No parsing, assembly or file writing of its own.
 
+NO ROLE NAME IS SPELLED HERE. bind_collaborators passes the taxonomy through
+and _summarize_lang reads its role table; adding a dependent role in config
+changes this module not at all.
+
 COMPILE TARGETS come from config/corpus_layout.yaml: `--scope` names a
 target (or alias), which decides the partitions read, the artifact written,
 the locales emitted and the source prefixes the artifact must never contain.
@@ -74,7 +78,8 @@ def bind_collaborators(config, renderer) -> dict:
 
     return {
         "layout": layout,
-        "parse_text": functools.partial(ast_blocks.parse_text, grammar, taxonomy.admonition_callout_kind),
+        "parse_text": functools.partial(ast_blocks.parse_text, grammar),
+        "parent_anchor_of": functools.partial(integrity.parent_anchor_of, grammar),
         "render": renderer,
         "summarize": functools.partial(rendering.plain_text_summary, max_len=SUMMARY_MAX_LEN),
         "metadata_from_text": functools.partial(frontmatter.metadata_from_text,
@@ -131,17 +136,29 @@ def parse_args(argv):
     return parser.parse_args(argv)
 
 
-def _summarize_lang(scope: str, lang: str, graph: dict) -> str:
+def _summarize_lang(scope: str, lang: str, graph: dict, taxonomy) -> str:
+    """One line per locale. Dependent counts come from the ROLE TABLE.
+
+    This function used to sum n["debates"] and n["ops"] by name -- the same
+    two-role assumption that made graph_builder route every third role into
+    "ops". Here it was quieter: a declared role with no hardcoded line simply
+    never appeared in the summary, so `evi` entries would compile, index and
+    render while the operator's only per-build readout said nothing about
+    them. Driven off taxonomy.dependent_roles, a new role counts itself.
+    """
     partitions = graph["partitions"]
     documents = sum(len(p["documents"]) for p in partitions)
-    debates = sum(len(n["debates"]) for p in partitions for d in p["documents"] for n in d["nodes"])
-    ops = sum(len(n["ops"]) for p in partitions for d in p["documents"] for n in d["nodes"])
+    nodes = [n for p in partitions for d in p["documents"] for n in d["nodes"]]
+    per_role = []
+    for role in taxonomy.dependent_roles:
+        graph_key = taxonomy.callout_graph_key(role)
+        per_role.append("%d %s" % (sum(len(n.get(graph_key, ())) for n in nodes), graph_key))
     per_partition = ["%s=%ddoc/%dnode" % (p["id"], len(p["documents"]),
                                           sum(d["node_count"] for d in p["documents"]))
                      for p in partitions if p["documents"]]
-    return ("%s scope=%s lang=%s: %d document(s) [%s], %d node(s), %d debate(s), %d ops entr(y/ies)"
+    return ("%s scope=%s lang=%s: %d document(s) [%s], %d node(s), %s"
             % (TAG, scope, lang, documents, ", ".join(per_partition) or "none",
-               graph_builder.total_nodes(graph), debates, ops))
+               graph_builder.total_nodes(graph), ", ".join(per_role)))
 
 
 def main(argv=None) -> int:
@@ -213,7 +230,7 @@ def main(argv=None) -> int:
         return EXIT_FAILED
 
     for lang in layout.locales:
-        print(_summarize_lang(args.scope, lang, per_lang[lang]))
+        print(_summarize_lang(args.scope, lang, per_lang[lang], config.taxonomy))
     print("%s Wrote %s (%s, %s, %d total node(s)%s)." % (
         TAG, output, source.describe(), result.strategy, full_graph["metadata"]["total_nodes"],
         ", %d item(s) excluded" % len(errors) if errors else ""))

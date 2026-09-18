@@ -19,6 +19,11 @@ TWO HALVES, ONE FILE.
   Container half (_run_checks): imports lte.engine / lte.io lazily and
   runs only when LTE_HOOK_IN_CONTAINER=1 or LTE_HOOK_NO_DOCKER=1.
 
+  The five payload_lock calls below no longer pass an admonition->kind map.
+  A dependent block's role comes from the configured alias table, which
+  reaches payload_lock on the Grammar it already takes, so the parameter had
+  become a second path for information already present.
+
 Install (symlink resolves to the code checkout, so the hook follows updates):
   ln -sf ../../lte/cli/hooks/pre_commit.py .git/hooks/pre-commit
 
@@ -187,7 +192,6 @@ def _run_checks(hook_args):
         _say("CONFIG ERROR: {0}".format(exc))
         return EXIT_BLOCK
     grammar, layout = config.grammar, config.layout
-    kinds = config.taxonomy.admonition_callout_kind
     prefix, suffixes = layout.root_prefix(), layout.listing_suffixes()
     client = GitClient(cwd=args.work_tree, safe_directory=True)
 
@@ -209,8 +213,8 @@ def _run_checks(hook_args):
         _say("GIT ERROR: {0}".format(exc))
         return EXIT_BLOCK
 
-    head_refs = payload_lock.reference_map(grammar, kinds, head_images, layout=layout)
-    lock_refs = (payload_lock.reference_map(grammar, kinds, index_images, layout=layout)
+    head_refs = payload_lock.reference_map(grammar, head_images, layout=layout)
+    lock_refs = (payload_lock.reference_map(grammar, index_images, layout=layout)
                  if args.lock_on_staged else head_refs)
 
     policy = grammar.payload_lock
@@ -220,16 +224,16 @@ def _run_checks(hook_args):
         if change.status not in ("M", "D", "R"):
             continue
         lock_violations += payload_lock.check_payload_lock(
-            grammar, kinds, change,
+            grammar, change,
             head_images.get(change.old_path),
             None if change.status == "D" else index_images.get(change.path),
             lock_refs, mutable, layout=layout)
 
-    transitions = payload_lock.newly_invalidating(grammar, kinds, changes,
+    transitions = payload_lock.newly_invalidating(grammar, changes,
                                                   head_images, index_images, layout=layout)
     by_head_path = dict((c.old_path, c) for c in changes)
     atomic_violations = payload_lock.check_atomic_deprecation(
-        grammar, kinds, transitions, head_refs, by_head_path, index_images, layout=layout)
+        grammar, transitions, head_refs, by_head_path, index_images, layout=layout)
 
     enforced = bool(policy.get("enforced", True))
     blocking = list(atomic_violations) + (lock_violations if enforced else [])

@@ -11,18 +11,32 @@ a staged draft lands. This module splits no path and builds no suffix.
 
 HARD FAILURES (block ingest): target not a corpus file, unclosed code fence,
 duplicate anchor, misplaced anchor domain, orphan reference, public->private
-reference, dependent-lifecycle front matter, and a zero-block file in a
-partition whose unindexed policy is "fail".
+reference, dependent-lifecycle front matter, banned constructs (admonitions,
+tables), and a zero-block file in a partition whose unindexed policy is
+"fail".
 
-WARNINGS (never block): file-naming convention, anchor/ref lines that look
-intended but do not match the grammar (config: diagnostic_patterns), and
-`note` admonitions that will not compile to a node. These are heuristics by
-design; the real grammar is the only arbiter of what is valid.
+DIAGNOSTIC PATTERNS COME FROM THE GRAMMAR, not from a second compile. This
+module used to build its own DiagnosticPatterns from the same
+`diagnostic_patterns` block lte/engine/grammar.py already compiles onto the
+Grammar. Two compilations of one config block is not just wasted work: they
+are two places a future pattern can be added to, and the pre-ingest gate
+silently disagreeing with the corpus linter about what counts as a banned
+construct is the exact failure a draft gate exists to prevent.
+
+WARNINGS (never block): file-naming convention, and anchor/ref lines that
+look intended but do not match the grammar (grammar.loose_anchor_line /
+grammar.loose_ref_line).
+These are heuristics by design; the real grammar is the only arbiter of what
+is valid.
+
+BANNED CONSTRUCTS ARE ERRORS, NOT WARNINGS. Admonition openers and Markdown
+table rows are not heuristics -- the grammar definitely will not accept
+them, so a draft carrying one ingests clean and compiles empty. That is the
+one class of finding here where being lenient loses content.
 """
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
@@ -45,12 +59,6 @@ class DraftReport:
     @property
     def ok(self) -> bool:
         return not self.errors
-
-
-@dataclass(frozen=True)
-class DiagnosticPatterns:
-    loose_anchor_line: re.Pattern
-    loose_ref_line: re.Pattern
 
 
 # ------------------------------------------------------------ small helpers
@@ -82,39 +90,12 @@ def _label(obj) -> str:
     if hasattr(obj, "spec_id"):
         return "^" + obj.spec_id
     if hasattr(obj, "target_id"):
-        return "[!%s-%s]" % (getattr(obj, "kind", "ref"), obj.target_id)
+        # The AUTHORED token, falling back to the internal role. The old
+        # default here was the literal "ref", which would mislabel every
+        # dependent block once the alias table stopped containing it.
+        token = getattr(obj, "token", "") or getattr(obj, "kind", "?")
+        return "[!%s-%s]" % (token, obj.target_id)
     return str(obj)
-
-
-def compile_diagnostic_patterns(linter_rules: Mapping) -> DiagnosticPatterns:
-    """Compiles the quarantined `diagnostic_patterns` block, fail-fast."""
-    block = linter_rules.get("diagnostic_patterns")
-    counts = linter_rules.get("diagnostic_required_group_counts") or {}
-    if not isinstance(block, Mapping):
-        raise ConfigError("linter_rules.json: missing diagnostic_patterns block")
-    compiled = {}
-    for name in ("loose_anchor_line", "loose_ref_line"):
-        template = block.get(name)
-        if not isinstance(template, str):
-            raise ConfigError("linter_rules.json: diagnostic_patterns.%s missing" % name)
-        try:
-            pattern = re.compile(template)
-        except re.error as exc:
-            raise ConfigError("diagnostic_patterns.%s does not compile: %s" % (name, exc)) from exc
-        expected = counts.get(name)
-        if expected is not None and pattern.groups != expected:
-            raise ConfigError("diagnostic_patterns.%s: expected %d group(s), found %d"
-                              % (name, expected, pattern.groups))
-        compiled[name] = pattern
-    return DiagnosticPatterns(**compiled)
-
-
-def find_linter_rules(raw_config: Mapping) -> Mapping:
-    """Locates the parsed linter_rules document inside config_reader.read_raw()."""
-    for value in raw_config.values():
-        if isinstance(value, Mapping) and "diagnostic_patterns" in value:
-            return value
-    raise ConfigError("no parsed config document carries diagnostic_patterns")
 
 
 def _outside_fences(text: str):
@@ -169,63 +150,72 @@ def check_fence_parity(text: str) -> list:
     return []
 
 
-def check_likely_typos(grammar: Grammar, patterns: DiagnosticPatterns, text: str) -> list:
+def check_likely_typos(grammar: Grammar, text: str) -> list:
+    """Lines that look like a token but match no compiled pattern.
+
+    The 4-space dedent is gone with Grammar 2: nothing indents a token any
+    more, so a line is tested exactly as authored. The two admonition
+    fallbacks (admonition_trailing_anchor, admonition_ref_line) are gone for
+    the harder reason -- those attributes no longer exist on Grammar, so this
+    function raised AttributeError on the first anchor-shaped line it saw.
+    """
     found = []
     for number, line in _outside_fences(text):
-        body = line[4:] if line.startswith("    ") else line
-        anchor = patterns.loose_anchor_line.match(line)
-        if anchor and not (grammar.spec_anchor.match(body)
-                           or grammar.admonition_trailing_anchor.match(body)):
+        anchor = grammar.loose_anchor_line.match(line)
+        if anchor and not grammar.spec_anchor.match(line.strip()):
             found.append((number, "'^%s' looks like an anchor but does not match the grammar "
                                   "(domain must be one of the configured partition domains)"
                           % anchor.group(1)))
-        ref = patterns.loose_ref_line.match(line)
-        if ref and not (grammar.ref_callout_start.match(body)
-                        or grammar.admonition_ref_line.match(body)):
-            found.append((number, "'[!%s]' looks like a reference but does not match "
-                                  "[!ref-<anchor-id>]" % ref.group(1)))
+        ref = grammar.loose_ref_line.match(line)
+        if ref and not grammar.ref_callout_start.match(line):
+            found.append((number, "'[!%s]' looks like a dependent block but does not match "
+                                  "[!<kind>-<anchor-id>] for any configured kind (%s)"
+                          % (ref.group(1), ", ".join(sorted(grammar.callout_kind_aliases)))))
     return found
 
 
-def check_truncated_admonitions(grammar: Grammar, text: str) -> list:
-    lines = text.splitlines()
-    outside = {n for n, _ in _outside_fences(text)}
-    found, i = [], 0
-    while i < len(lines):
-        opener = grammar.admonition_open.match(lines[i]) if (i + 1) in outside else None
-        if not opener:
-            i += 1
-            continue
-        j, has_anchor = i + 1, False
-        while j < len(lines) and (grammar.admonition_blank.match(lines[j])
-                                  or grammar.admonition_indent.match(lines[j])):
-            indented = grammar.admonition_indent.match(lines[j])
-            if indented and grammar.admonition_trailing_anchor.match(indented.group("rest")):
-                has_anchor = True
-            j += 1
-        if opener.group("type") == "note" and not has_anchor:
-            message = ('note block "%s" has no trailing ^anchor in its indented body and '
-                       'will not compile to a contract node' % opener.group("title"))
-            if j < len(lines):
-                message += ("; the body ends at line %d (first non-blank line indented fewer "
-                            "than 4 spaces)" % (j + 1))
-            found.append((i + 1, message))
-        i = max(j, i + 1)
+def check_banned_constructs(grammar: Grammar, text: str) -> list:
+    """Admonition openers and Markdown table rows -- pure-text violations.
+
+    REPLACES check_truncated_admonitions(), which read six Grammar
+    attributes that no longer exist and whose whole purpose was warning that
+    a `note` block would not compile to a node. No admonition compiles to
+    anything now, so the warning is obsolete and the construct is banned.
+
+    A HARD ERROR HERE, not a warning, matching lte/validators/corpus.py's
+    Check 6. Everything else this module warns about is a heuristic that the
+    real grammar may still accept; this one is the opposite -- the grammar
+    definitely will not accept it, and the file would ingest clean and
+    compile empty.
+
+    Fence-aware, unlike the corpus linter's line-based version: a draft is
+    one file a human is actively editing, and code samples showing the old
+    syntax are exactly what someone writes while migrating.
+    """
+    found = []
+    for number, line in _outside_fences(text):
+        if grammar.loose_admonition_open.match(line):
+            found.append((number, "admonition blocks are not parsed and compile to nothing; "
+                                  "use a heading with a bare ^anchor, or a top-level "
+                                  "'>' dependent block"))
+        elif grammar.loose_table_row.match(line):
+            found.append((number, "Markdown tables are banned in node bodies; express "
+                                  "tabular rules as separately anchored sub-blocks"))
     return found
 
 
 # ------------------------------------------------------------- aggregate
 
-def _file_checks(config, rel_path: str, text: str, patterns: DiagnosticPatterns) -> tuple:
+def _file_checks(config, rel_path: str, text: str) -> tuple:
     """Checks that need only the file itself. Returns (errors, warnings, nodes, callouts)."""
     grammar, layout = config.grammar, config.layout
-    taxonomy = config.taxonomy
     errors, warnings = check_target_path(layout, grammar, rel_path)
     errors += ["%s:%d: %s" % (rel_path, n, m) for n, m in check_fence_parity(text)]
-    warnings += ["%s:%d: %s" % (rel_path, n, m) for n, m in check_likely_typos(grammar, patterns, text)]
-    warnings += ["%s:%d: %s" % (rel_path, n, m) for n, m in check_truncated_admonitions(grammar, text)]
+    warnings += ["%s:%d: %s" % (rel_path, n, m) for n, m in check_likely_typos(grammar, text)]
+    errors += ["%s:%d: BANNED CONSTRUCT -- %s" % (rel_path, n, m)
+               for n, m in check_banned_constructs(grammar, text)]
 
-    nodes, callouts = ast_blocks.parse_text(grammar, taxonomy.admonition_callout_kind, rel_path, text)
+    nodes, callouts = ast_blocks.parse_text(grammar, rel_path, text)
 
     if state_machine.is_dependent_document(grammar, rel_path, layout=layout):
         fm = frontmatter.parse_text(text, grammar.frontmatter_fence)
@@ -243,8 +233,8 @@ def _file_checks(config, rel_path: str, text: str, patterns: DiagnosticPatterns)
     return errors, warnings, list(nodes), list(callouts)
 
 
-def validate_batch(config, candidates: Mapping, corpus_documents: Iterable,
-                   patterns: DiagnosticPatterns) -> DraftReport:
+def validate_batch(config, candidates: Mapping,
+                   corpus_documents: Iterable) -> DraftReport:
     """
     Validates every changed file at once against the corpus it joins.
 
@@ -257,13 +247,12 @@ def validate_batch(config, candidates: Mapping, corpus_documents: Iterable,
     files that reference each other validate against each other.
     """
     taxonomy, grammar, layout = config.taxonomy, config.grammar, config.layout
-    kinds = taxonomy.admonition_callout_kind
     changed = frozenset(candidates)
     errors, warnings = [], []
     node_count = callout_count = 0
     parsed = {}
     for rel_path in sorted(candidates):
-        e, w, nodes, callouts = _file_checks(config, rel_path, candidates[rel_path], patterns)
+        e, w, nodes, callouts = _file_checks(config, rel_path, candidates[rel_path])
         errors += e
         warnings += w
         parsed[rel_path] = (nodes, callouts)
@@ -286,7 +275,7 @@ def validate_batch(config, candidates: Mapping, corpus_documents: Iterable,
                 draft_callouts += parsed[rel_path][1]
         corpus_nodes = []
         for rel_path, text in sorted(corpus_by_locale.get(locale, [])):
-            corpus_nodes += ast_blocks.parse_text(grammar, kinds, rel_path, text)[0]
+            corpus_nodes += ast_blocks.parse_text(grammar, rel_path, text)[0]
         all_nodes = corpus_nodes + draft_nodes
 
         for anchor, group in sorted(integrity.find_duplicate_spec_ids(all_nodes).items()):
@@ -309,11 +298,11 @@ def validate_batch(config, candidates: Mapping, corpus_documents: Iterable,
 
 
 def validate_draft(config, draft_text: str, target: str,
-                   corpus_documents: Iterable, patterns: DiagnosticPatterns) -> DraftReport:
+                   corpus_documents: Iterable) -> DraftReport:
     """
     `config` is an lte.io.config_reader.EngineConfig. `corpus_documents` is
     the (rel_path, text) set the draft joins -- typically the CAS branch
     tip. The document currently stored at `target` is excluded: the draft
     replaces it.
     """
-    return validate_batch(config, {target: draft_text}, corpus_documents, patterns)
+    return validate_batch(config, {target: draft_text}, corpus_documents)

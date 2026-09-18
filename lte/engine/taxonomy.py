@@ -108,17 +108,21 @@ class Taxonomy:
     # scope id -> partition ids in declaration order
     partitions_by_scope: Mapping[str, tuple]
     partition_flavor: Mapping[str, str]
-    # admonition type -> {"layer_by_flavor": {...}, "callout_kind": "..."}
-    admonition_projection: Mapping[str, Mapping]
-    # admonition type -> "ref" | "ops". 'note' is absent by design: a note
-    # block returns a SpecNode and never reaches this lookup.
-    admonition_callout_kind: Mapping[str, str]
+    # AST role -> {"layer_by_flavor": {...}, ...}. Two tables, because the
+    # two entity classes are not interchangeable: a contract role emits a
+    # node and has no graph_key; a dependent role emits a callout and must
+    # have one.
+    node_projection: Mapping[str, Mapping]
+    callout_projection: Mapping[str, Mapping]
+    # Dependent roles in ui_projection declaration order. ORDER IS
+    # LOAD-BEARING: graph_builder emits one array per role in this order, and
+    # graph_hash depends on the resulting key order.
+    dependent_roles: tuple
 
     # -- layer projection ------------------------------------------------
 
-    def layer_for(self, admonition_type: str, partition: str) -> str:
-        """Resolves the Layer 1/2/3 label for `partition` under the AST role
-        `admonition_type` denotes.
+    def _flavor_of(self, partition: str) -> str:
+        """The declared flavor of `partition`.
 
         RAISES for an unknown partition rather than defaulting. The code this
         ultimately replaces was
@@ -136,27 +140,54 @@ class Taxonomy:
                 "{0!r} is not a declared partition (known: {1})".format(
                     partition, sorted(self.partition_flavor))
             ) from None
-        # layer_by_flavor completeness across every declared flavor is
-        # verified once, at construction, by validate_ui_projection().
-        return self.admonition_projection[admonition_type]["layer_by_flavor"][flavor]
+        return flavor
 
     def contract_layer_of(self, partition: str) -> str:
-        """Layer 1 -- KERNEL_CONTRACT / POLICY_CONTRACT / META_CONSTITUTION."""
-        return self.layer_for("note", partition)
+        """Layer 1 -- KERNEL_CONTRACT / POLICY_CONTRACT / META_CONSTITUTION.
 
-    def debate_layer_of(self, partition: str) -> str:
-        """Layer 2 -- TECHNICAL_DEBATE / POLICY_DEBATE / META_DEBATE.
-
-        Serves both Grammar-2 `???+ warning` blocks and Grammar-1
-        `> [!ref-...]` callouts; validate_ui_projection asserts those two
-        declarations agree.
+        layer_by_flavor completeness across every declared flavor is verified
+        once, at construction, by validate_ui_projection().
         """
-        return self.layer_for("warning", partition)
+        return self.node_projection["contract"]["layer_by_flavor"][self._flavor_of(partition)]
 
-    def ops_layer_of(self, partition: str) -> str:
-        """Layer 3 -- OPERATIONAL_EXTENSIONS / EXECUTION_CHECKLIST /
-        META_CHECKLIST."""
-        return self.layer_for("tip", partition)
+    def callout_layer_of(self, role: str, partition: str) -> str:
+        """The Layer 2/3 label for a dependent block of `role` in `partition`.
+
+        REPLACES debate_layer_of() and ops_layer_of(), which were a
+        two-function enumeration of a table that now has three rows and may
+        have more. A pair of named methods is the same shape as
+        graph_builder's old `if kind == "ref" ... else` -- it works until a
+        role is added, then quietly routes the new one to whichever branch
+        the else happens to be.
+
+        RAISES for an unknown role rather than defaulting, for the same
+        reason _flavor_of() raises for an unknown partition: every live call
+        site passes a role resolved through the grammar's alias table, so
+        this path is unreachable -- which is the reason to make it loud.
+        """
+        try:
+            spec = self.callout_projection[role]
+        except KeyError:
+            raise KeyError(
+                "{0!r} is not a declared dependent role (known: {1})".format(
+                    role, sorted(self.callout_projection))
+            ) from None
+        return spec["layer_by_flavor"][self._flavor_of(partition)]
+
+    def callout_graph_key(self, role: str) -> str:
+        """The graph.json array name a dependent role's entries occupy.
+
+        `debates` and `ops` are historical names app.js already reads; they
+        are declared in config rather than derived from the role id so that
+        renaming a role never renames a published JSON key.
+        """
+        try:
+            return self.callout_projection[role]["graph_key"]
+        except KeyError:
+            raise KeyError(
+                "{0!r} is not a declared dependent role (known: {1})".format(
+                    role, sorted(self.callout_projection))
+            ) from None
 
     # -- anchor -> placement --------------------------------------------
 
@@ -285,7 +316,8 @@ def build_taxonomy(rows: Sequence[Mapping[str, str]],
         partitions.append((pid, row["label"], domain, row["codeowner"], row["scope"]))
         flavors[pid] = row["flavor"]
 
-    projection = validate_ui_projection(ui_projection, set(flavors.values()))
+    node_projection, callout_projection = validate_ui_projection(
+        ui_projection, set(flavors.values()))
 
     by_scope: dict = {}
     for p in partitions:
@@ -301,68 +333,136 @@ def build_taxonomy(rows: Sequence[Mapping[str, str]],
         known_domains=tuple(p[2] for p in partitions),
         partitions_by_scope={scope: tuple(ids) for scope, ids in by_scope.items()},
         partition_flavor=flavors,
-        admonition_projection=projection,
-        admonition_callout_kind={
-            a_type: spec["callout_kind"]
-            for a_type, spec in projection.items()
-            if spec.get("callout_kind")
-        },
+        node_projection=node_projection,
+        callout_projection=callout_projection,
+        dependent_roles=tuple(callout_projection),
     )
 
 
-def validate_ui_projection(ui_projection: Mapping, flavors: set) -> Mapping:
+def validate_ui_projection(ui_projection: Mapping, flavors: set) -> tuple:
     """Validates config/ui_projection.yaml against the declared flavor set.
+
+    Returns (node_projection, callout_projection).
 
     THE COMPLETENESS CHECK IS THE POINT. Every flavor declared in the
     taxonomy must appear in every layer_by_flavor map. Without it, adding a
     partition with a new flavor produces a KeyError deep inside a corpus
     walk -- or worse, a silent fallthrough to a default label -- rather than
     a clear error at construction time.
+
+    WHAT THIS NO LONGER READS. The `admonitions:` block is gone with Grammar
+    2. Worth stating rather than quietly dropping: that block was the ONLY
+    one the previous revision read. The old `callout_kinds:` block was never
+    consulted by anything, and Grammar-1 callouts resolved their layer
+    through the admonition table (debate_layer_of -> layer_for("warning")).
+    So this is not a legacy-path deletion; it is a rewrite of the only live
+    path, and ui_projection.yaml must be re-keyed in the same commit.
+
+    THE ROLE SET IS SELF-DECLARING HERE. config_reader builds the taxonomy
+    before it compiles the grammar, so this function cannot cross-check
+    against dependent_lifecycle.dependent_roles. That check needs both
+    finished objects and lives in assert_callout_roles_agree(), called from
+    config_reader.load() -- the same post-hoc shape as
+    assert_dependent_roles_producible().
     """
-    admonitions = ui_projection.get("admonitions")
-    if not isinstance(admonitions, dict) or not admonitions:
-        raise TaxonomyError("ui_projection: 'admonitions' must be a non-empty mapping.")
-
-    for a_type in ("note", "warning", "tip"):
-        if a_type not in admonitions:
-            raise TaxonomyError(
-                "ui_projection.admonitions is missing {0!r}. All three admonition "
-                "types are reachable from the grammar.".format(a_type))
-
-    for a_type, spec in admonitions.items():
+    def _check_layers(table: str, role: str, spec: Mapping) -> None:
         if not isinstance(spec, dict):
             raise TaxonomyError(
-                "ui_projection.admonitions.{0} must be a mapping.".format(a_type))
+                "ui_projection.{0}.{1} must be a mapping.".format(table, role))
         by_flavor = spec.get("layer_by_flavor")
         if not isinstance(by_flavor, dict):
             raise TaxonomyError(
-                "ui_projection.admonitions.{0}.layer_by_flavor must be a mapping.".format(
-                    a_type))
+                "ui_projection.{0}.{1}.layer_by_flavor must be a mapping.".format(
+                    table, role))
         missing = sorted(flavors - set(by_flavor))
         if missing:
             raise TaxonomyError(
-                "ui_projection.admonitions.{0}.layer_by_flavor has no entry for "
-                "flavor(s) {1}. Every flavor declared in the taxonomy needs a label, "
-                "or a partition using it falls through to nothing.".format(a_type, missing))
+                "ui_projection.{0}.{1}.layer_by_flavor has no entry for flavor(s) "
+                "{2}. Every flavor declared in the taxonomy needs a label, or a "
+                "partition using it falls through to nothing.".format(
+                    table, role, missing))
         extra = sorted(set(by_flavor) - flavors)
         if extra:
             raise TaxonomyError(
-                "ui_projection.admonitions.{0}.layer_by_flavor declares flavor(s) {1} "
-                "that no partition uses -- dead config that looks live.".format(
-                    a_type, extra))
+                "ui_projection.{0}.{1}.layer_by_flavor declares flavor(s) {2} that "
+                "no partition uses -- dead config that looks live.".format(
+                    table, role, extra))
 
-    # `note` must NOT declare a callout_kind: a note block compiles to a
-    # SpecNode, never to a callout, so the value would never be read.
-    if admonitions["note"].get("callout_kind"):
+    node_projection = ui_projection.get("node_projection")
+    if not isinstance(node_projection, dict) or "contract" not in node_projection:
         raise TaxonomyError(
-            "ui_projection.admonitions.note declares callout_kind={0!r}, but a note "
-            "block compiles to a SpecNode and never to a callout. The value would "
-            "never be read.".format(admonitions["note"]["callout_kind"]))
-    for a_type in ("warning", "tip"):
-        kind = admonitions[a_type].get("callout_kind")
-        if kind not in ("ref", "ops"):
+            "ui_projection: 'node_projection' must be a mapping declaring at least "
+            "'contract'. A corpus with no contract projection has no middle pane.")
+    for role, spec in node_projection.items():
+        _check_layers("node_projection", role, spec)
+        if spec.get("graph_key"):
             raise TaxonomyError(
-                "ui_projection.admonitions.{0}.callout_kind={1!r} must be 'ref' or "
-                "'ops'.".format(a_type, kind))
+                "ui_projection.node_projection.{0} declares graph_key={1!r}, but a "
+                "node is emitted as a contract node, never into a dependent array. "
+                "The value would never be read.".format(role, spec["graph_key"]))
 
-    return admonitions
+    callout_projection = ui_projection.get("callout_kinds")
+    if not isinstance(callout_projection, dict) or not callout_projection:
+        raise TaxonomyError(
+            "ui_projection: 'callout_kinds' must be a non-empty mapping keyed on "
+            "INTERNAL dependent roles, not on authored tokens. Tokens are "
+            "renameable in linter_rules.json#callout_kinds.aliases; a layer table "
+            "keyed on them would move every label on a rename.")
+
+    if "admonitions" in ui_projection:
+        raise TaxonomyError(
+            "ui_projection still declares an 'admonitions' block. Grammar 2 is "
+            "removed and nothing reads it; leaving it in place would be a second, "
+            "stale copy of the layer labels. Delete the block.")
+
+    # graph_key must be present, unique, and must not collide with a field
+    # graph_builder already writes onto a contract node -- entry[graph_key]
+    # = [] would silently overwrite it.
+    RESERVED = {"anchor_id", "title", "layer", "body", "status", "parent_anchor"}
+    seen_keys: dict = {}
+    for role, spec in callout_projection.items():
+        _check_layers("callout_kinds", role, spec)
+        graph_key = spec.get("graph_key")
+        if not isinstance(graph_key, str) or not graph_key:
+            raise TaxonomyError(
+                "ui_projection.callout_kinds.{0} has no 'graph_key'. Every "
+                "dependent role needs the graph.json array name its entries "
+                "occupy.".format(role))
+        if graph_key in RESERVED:
+            raise TaxonomyError(
+                "ui_projection.callout_kinds.{0}.graph_key={1!r} collides with a "
+                "contract node field. The array would overwrite it.".format(
+                    role, graph_key))
+        if graph_key in seen_keys:
+            raise TaxonomyError(
+                "ui_projection.callout_kinds.{0}.graph_key={1!r} is already used by "
+                "role {2!r}. Two roles sharing an array is indistinguishable "
+                "downstream from one role.".format(role, graph_key, seen_keys[graph_key]))
+        seen_keys[graph_key] = role
+
+    return node_projection, callout_projection
+
+
+def assert_callout_roles_agree(taxonomy: "Taxonomy", grammar) -> None:
+    """Cross-check: ui_projection's dependent roles and linter_rules'
+    dependent_lifecycle.dependent_roles must be the SAME SET.
+
+    Separate from build_taxonomy() because it needs the finished Grammar,
+    which config_reader compiles second. Same shape and same reason as
+    grammar.assert_dependent_roles_producible().
+
+    Both directions are errors, not just one. A role in linter_rules with no
+    ui_projection row has no layer or array and would KeyError mid-walk. A
+    role in ui_projection with no linter_rules row can never be produced by
+    any alias, so its array is emitted empty on every node forever -- dead
+    weight in every artifact, which is the harder one to notice.
+    """
+    declared = set(taxonomy.dependent_roles)
+    lifecycle = set(grammar.dependent_lifecycle["dependent_roles"])
+    if declared != lifecycle:
+        raise TaxonomyError(
+            "dependent role sets disagree: ui_projection.callout_kinds declares {0}, "
+            "linter_rules.json dependent_lifecycle.dependent_roles declares {1}. "
+            "Only in ui_projection: {2}. Only in linter_rules: {3}.".format(
+                sorted(declared), sorted(lifecycle),
+                sorted(declared - lifecycle), sorted(lifecycle - declared)))
