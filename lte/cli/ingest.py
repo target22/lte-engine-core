@@ -27,6 +27,13 @@ REPLACES scripts/core_pipeline/ingest.py AND batch_sync.py. Two modes:
 Where the corpus lives, which files belong to it and where a staged draft
 lands are answers from config/corpus_layout.yaml (config.layout).
 
+DIAGNOSTIC PATTERNS ARE NOT ASSEMBLED HERE. This module used to build a
+DiagnosticPatterns object per call and hand it to the validator; that object
+was a second compilation of a config block lte/engine/grammar.py already
+compiles onto the Grammar, and it reached the validator by a path an
+orchestrator had no business knowing about. The validator now reads
+grammar.loose_* directly off the Grammar it already receives via `config`.
+
 Exit codes: 0 ingested / nothing to do, 1 rejected or git failure,
 2 usage or configuration error. Holds no domain logic: every check lives in
 lte.validators, every git call in lte.io.git_cas_client.
@@ -131,8 +138,7 @@ def run_single(args, config, cas: GitClient) -> int:
     paths = cas.list_paths(tip, layout.root_prefix(), layout.listing_suffixes()) if tip else []
     corpus = cas.read_texts(tip, paths).items() if tip else []
 
-    report = draft_validator.validate_draft(config, draft_text, target, corpus,
-                                            _diagnostic_patterns(config))
+    report = draft_validator.validate_draft(config, draft_text, target, corpus)
 
     for line in report.warnings:
         _out("WARN  " + line)
@@ -157,11 +163,6 @@ def run_single(args, config, cas: GitClient) -> int:
     else:
         _out("COMMITTED %s -> %s@%s" % (summary, args.branch, result.commit[:12]))
     return EXIT_OK
-
-
-def _diagnostic_patterns(config):
-    return draft_validator.compile_diagnostic_patterns(
-        draft_validator.find_linter_rules(config_reader.read_raw(config.config_dir, config.repo_root)))
 
 
 def _summary(added, updated, unchanged, skipped, commit, started) -> str:
@@ -231,7 +232,7 @@ def run_batch(args, config, cas: GitClient) -> int:
 
     if candidates:
         corpus = cas.read_texts(tip, sorted(existing)).items() if tip else []
-        report = draft_validator.validate_batch(config, candidates, corpus, _diagnostic_patterns(config))
+        report = draft_validator.validate_batch(config, candidates, corpus)
         warnings += list(report.warnings)
         for line in warnings:
             print("[WARN] %s" % line, file=sys.stderr)
